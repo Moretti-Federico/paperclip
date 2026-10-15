@@ -304,6 +304,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
   });
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
   let cleanupRemoteWorkspace: (() => Promise<void>) | undefined;
+  let grokAuthCopyBackFailed = false;
   // Declared here (not inside the try) so the outer `finally` can remove it on
   // every exit path (teardown and setup failure alike), mirroring the Codex
   // adapter's `stagedCodexHomeDir` handling.
@@ -442,13 +443,14 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
                 // value read from `env.GROK_HOME`. A copy-out failure never
                 // fails the run: `copyBackGrokAuth` logs the errno code and
                 // rethrows, and this callback swallows that rejection.
-                restore: async ({ assetDir, readFile }) =>
-                  void (await copyBackGrokAuth({
+                restore: async ({ assetDir, readFile }) => {
+                  await copyBackGrokAuth({
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostHomeDir: hostGrokHome,
                     log: (line) => onLog("stdout", `${line}\n`),
                     env: process.env,
-                  }).catch(() => undefined)),
+                  }).catch(() => { grokAuthCopyBackFailed = true; });
+                },
               },
             ]
           : undefined,
@@ -761,7 +763,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
       async () => { await restoreRemoteWorkspace?.(); },
     );
     await cleanupRestoredRunWorkspace({
-      cleanup: cleanupRemoteWorkspace,
+      cleanup: grokAuthCopyBackFailed ? undefined : cleanupRemoteWorkspace,
       result: restoredResult,
       providerStopped: providerStop.hasStopped(),
       collectionSucceeded: true,
