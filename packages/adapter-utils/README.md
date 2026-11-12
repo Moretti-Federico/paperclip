@@ -104,7 +104,10 @@ because tar excludes globs while the baseline matches literal rooted paths:
   `*/node_modules/*` — tar matches bare names at any depth, and the expansion
   reproduces exactly that in the baseline matcher;
 - **rooted literal paths** (`build/dist`) and the rooted-contents form
-  (`build/dist/*`) are applied as-is;
+  (`build/dist/*`) are applied together with their any-depth companions
+  (`*/build/dist`, `*/build/dist/*`): tar excludes are un-anchored by
+  default, so these shapes also match nested `pkg/build/dist/...`, and the
+  companion keeps the baseline matcher on the same coverage;
 - the **any-depth forms** `*/name` and `*/name/*` are applied as-is;
 - **any other pattern is dropped** (fail closed): glob patterns such as
   `*.log` or `dist/*.map` are matched by tar but not by the baseline matcher,
@@ -112,7 +115,9 @@ because tar excludes globs while the baseline matches literal rooted paths:
   Dropping an exclude only transfers more files; it can never lose data.
 
 Passing `node_modules` alone is therefore sufficient (and equivalent to
-listing all four forms); listing all four forms explicitly is also fine.
+listing all four forms); the same holds for `build/dist` or `build/dist/*`
+alone — the companions are derived internally. Listing the expanded forms
+explicitly is also fine.
 
 ## Per-run SSH workspace retention (dry-run, disabled by default)
 

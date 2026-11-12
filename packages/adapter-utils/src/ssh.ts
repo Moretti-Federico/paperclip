@@ -1651,8 +1651,13 @@ export async function syncDirectoryFromSsh(input: {
  *   to the four equivalent forms `X`, "X slash star", "star slash X", "star
  *   slash X slash star": tar matches a bare name at any depth, and the
  *   expansion reproduces exactly that in the baseline matcher;
- * - rooted literal paths and their trailing "slash star" contents form stay
- *   as-is: both engines anchor them at the workspace root;
+ * - rooted literal paths (`dist/cache`) and their trailing "slash star"
+ *   contents form (`dist/cache slash star`) are kept and paired with their
+ *   any-depth companion ("star slash dist/cache" and its contents form):
+ *   tar's `--exclude` is un-anchored by default (`--no-anchored
+ *   --wildcards --wildcards-match-slash`), so these shapes also match
+ *   nested `pkg/dist/cache/...`, and only the companion form reproduces
+ *   that coverage in the baseline matcher;
  * - the any-depth forms (a leading "star slash" prefix) stay as-is: the
  *   matcher's any-depth reading covers everything tar's anchored glob can
  *   match;
@@ -1666,7 +1671,7 @@ export async function syncDirectoryFromSsh(input: {
  * segments are likewise dropped: excludes are workspace-relative by
  * contract.
  */
-function workspaceExcludePatternForms(pattern: string): string[] | null {
+export function workspaceExcludePatternForms(pattern: string): string[] | null {
   const trimmed = pattern.trim();
   if (trimmed.length === 0 || trimmed.startsWith("/")) return null;
   let core = trimmed;
@@ -1687,6 +1692,14 @@ function workspaceExcludePatternForms(pattern: string): string[] | null {
   // names at any depth, while the unexpanded matcher form is root-anchored.
   if (!anyDepth && !contentsOnly && segments.length === 1) {
     return [core, `${core}/*`, `*/${core}`, `*/${core}/*`];
+  }
+  // Rooted multi-segment literals and rooted contents forms need the
+  // any-depth companion as well: tar applies --exclude un-anchored, so
+  // `dist/cache` or `node_modules/*` also excludes nested
+  // `pkg/dist/cache/...`, and the matcher only reaches that depth through
+  // the companion form.
+  if (!anyDepth) {
+    return [trimmed, `*/${trimmed}`];
   }
   return [trimmed];
 }
