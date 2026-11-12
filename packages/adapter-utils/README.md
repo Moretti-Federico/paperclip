@@ -73,17 +73,18 @@ not regress that test.
 
 `prepareWorkspaceForSshExecution` and `prepareRemoteManagedRuntime` accept a
 `workspaceExclude` pattern list. The patterns are workspace-relative (absolute
-and parent-relative entries are dropped) and are interpreted identically on
-the Git and non-Git paths, in every file mode:
+paths, parent-relative `..` segments, and empty segments are dropped) and are
+interpreted identically on the Git and non-Git paths, in every file mode:
 
 - **upload**: the working-tree overlay (`tar`) skips the excluded paths. On
   the Git path the clean checkout from the imported history still happens
   first; the excludes only remove content from the overlay that would
   otherwise carry local ignored files (`.gitignore` alone does **not** keep
   `node_modules` out of the copy, because the overlay tars the whole tree).
-- **baseline**: the restore baseline is captured with exactly the exclude
-  list the upload applied — `prepareWorkspaceForSshExecution` returns it as
-  `transferExclude` and `prepareRemoteManagedRuntime` uses that verbatim.
+- **baseline**: the restore baseline is captured with exactly the canonical
+  exclude list the upload applied — `prepareWorkspaceForSshExecution` returns
+  it as `transferExclude` and `prepareRemoteManagedRuntime` uses that
+  verbatim.
 - **restore**: `mergeDirectoryWithBaseline` only considers files present in
   the baseline, so a file excluded from the upload is never treated as
   deleted-at-restore time and survives restore untouched.
@@ -94,8 +95,24 @@ dependency/cache excludes are imposed, and patterns should target content
 that is provably regenerable or provably irrelevant to the mandate; do not
 exclude tracked files or `.git` (both are handled internally).
 
-Recommended pattern form for a directory at any depth (`node_modules` here):
-`node_modules`, `node_modules/*`, `*/node_modules`, `*/node_modules/*`.
+Only pattern shapes that tar and the baseline matcher
+(`excludePatternMatches`) interpret with the same coverage are accepted,
+because tar excludes globs while the baseline matches literal rooted paths:
+
+- a **bare literal name** (`node_modules`) is expanded internally to the four
+  equivalent forms `node_modules`, `node_modules/*`, `*/node_modules`,
+  `*/node_modules/*` — tar matches bare names at any depth, and the expansion
+  reproduces exactly that in the baseline matcher;
+- **rooted literal paths** (`build/dist`) and the rooted-contents form
+  (`build/dist/*`) are applied as-is;
+- the **any-depth forms** `*/name` and `*/name/*` are applied as-is;
+- **any other pattern is dropped** (fail closed): glob patterns such as
+  `*.log` or `dist/*.map` are matched by tar but not by the baseline matcher,
+  so applying them would delete the matching local files at restore time.
+  Dropping an exclude only transfers more files; it can never lose data.
+
+Passing `node_modules` alone is therefore sufficient (and equivalent to
+listing all four forms); listing all four forms explicitly is also fine.
 
 ## Per-run SSH workspace retention (dry-run, disabled by default)
 
@@ -120,12 +137,15 @@ deliberately minimal step towards native retention:
   and crash replays do not duplicate decisions.
 - `sweepSshRunWorkspacesMetadataOnly` performs a read-only, metadata-only
   scan (`find` + bounded `du`) and returns a manifest. It never writes,
-  renames, quarantines, or deletes anything. An adapter-lane sweep has no
-  Paperclip API access, so its manifest reports every candidate as
-  `SKIP api_incomplete` by design; producing actionable decisions requires a
-  server-side evidence provider, and executing them requires a future,
-  separately authorized implementation with a shared native claim and proven
-  quarantine/restore.
+  renames, quarantines, or deletes anything. The policy time budget is
+  enforced with real clock readings (`now()` before planning and between
+  eligibility calls): SSH command timeouts are clamped to the remaining
+  budget, and candidates are deferred with `time_budget` instead of decided
+  once it is spent. An adapter-lane sweep has no Paperclip API access, so
+  its manifest reports every candidate as `SKIP api_incomplete` by design;
+  producing actionable decisions requires a server-side evidence provider,
+  and executing them requires a future, separately authorized
+  implementation with a shared native claim and proven quarantine/restore.
 - `prepareRemoteManagedRuntime` accepts an optional `runRetention` policy and
   runs the sweep after the run's `restoreWorkspace()` completes — the real
   finalization event of the SSH lane — excluding the current run. The sweep

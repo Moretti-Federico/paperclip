@@ -236,10 +236,15 @@ export interface SshRunRetentionBatchPlan {
 
 /**
  * Plans one retention batch: oldest candidates first, capped by directory
- * count, cumulative bytes, and remaining time budget. An idempotent receipt
+ * count, cumulative bytes, and the remaining time budget. An idempotent receipt
  * for an unchanged candidate (same key, same bytes, same generation) replays
  * the recorded decision instead of re-deciding, so concurrent finalizers and
  * crash-replay produce identical, non-duplicated plans.
+ *
+ * The planner is pure and synchronous, so it does not measure time itself:
+ * the caller passes the real elapsed time (`now()` readings taken before
+ * planning and between eligibility calls) and every candidate is deferred
+ * with `time_budget` once that elapsed time has consumed the policy budget.
  */
 export function planSshRunWorkspaceRetentionBatch(input: SshRunRetentionBatchPlanInput): SshRunRetentionBatchPlan {
   const { policy, nowMs } = input;
@@ -249,7 +254,7 @@ export function planSshRunWorkspaceRetentionBatch(input: SshRunRetentionBatchPla
   const entries: SshRunRetentionBatchEntry[] = [];
   const deferred: SshRunRetentionBatchDeferral[] = [];
   let plannedBytes = 0;
-  let elapsedMs = input.elapsedMs ?? 0;
+  const elapsedMs = input.elapsedMs ?? 0;
 
   for (const candidate of sorted) {
     const idempotencyKey = sshRunRetentionIdempotencyKey({
@@ -291,9 +296,6 @@ export function planSshRunWorkspaceRetentionBatch(input: SshRunRetentionBatchPla
     const { decision } = evaluateSshRunWorkspaceRetention(candidate, policy, nowMs);
     entries.push({ runId: candidate.runId, candidate, decision, idempotencyKey, replayed: false });
     plannedBytes += candidate.bytes;
-    // One decision ≈ one unit of budget work; the caller's elapsed time is
-    // authoritative and re-checked at the top of the loop.
-    elapsedMs += 1;
   }
 
   return { entries, deferred, plannedBytes };
@@ -413,6 +415,8 @@ export interface SshRunWorkspaceRetentionManifest {
   policyRevision: string;
   runsRoot: string;
   scannedAtMs: number;
+  /** Measured sweep duration (ms): `now()` readings, not estimates. */
+  elapsedMs: number;
   scanned: number;
   plannedBytes: number;
   decisions: Array<{
@@ -434,6 +438,11 @@ export interface SshRunWorkspaceRetentionManifest {
  * Never writes — no receipts, no renames, no deletions. Candidates without
  * an eligibility provider (the adapter-lane case) are reported as SKIP
  * `api_incomplete` by design.
+ *
+ * The policy time budget is enforced with real `now()` measurements taken
+ * before planning and between eligibility calls: SSH command timeouts are
+ * clamped to the remaining budget, and candidates are deferred with
+ * `time_budget` (never silently decided) once it is exhausted.
  */
 export async function sweepSshRunWorkspacesMetadataOnly(input: {
   spec: SshRemoteExecutionSpec;
@@ -446,13 +455,20 @@ export async function sweepSshRunWorkspacesMetadataOnly(input: {
   listNames?: () => Promise<Array<{ runId: string; newestMtimeMs: number }>>;
   listSizes?: (runIds: string[]) => Promise<Map<string, number>>;
 }): Promise<SshRunWorkspaceRetentionManifest> {
-  const nowMs = input.now ? input.now() : Date.now();
+  const now = input.now ?? Date.now;
+  const startedAtMs = now();
+  const elapsedMs = () => now() - startedAtMs;
+  const remainingBudgetMs = () => input.policy.timeBudgetMs - elapsedMs();
+  // Clamp every SSH command to the remaining budget (at least 1 ms so a
+  // nearly-spent budget surfaces as a command failure rather than a hang).
+  const clampTimeoutMs = (fallbackMs: number) => Math.max(1, Math.min(fallbackMs, remainingBudgetMs()));
   if (!input.policy.enabled) {
     return {
       mode: "disabled",
       policyRevision: input.policy.policyRevision,
       runsRoot: input.runsRoot,
-      scannedAtMs: nowMs,
+      scannedAtMs: startedAtMs,
+      elapsedMs: 0,
       scanned: 0,
       plannedBytes: 0,
       decisions: [],
@@ -464,11 +480,28 @@ export async function sweepSshRunWorkspacesMetadataOnly(input: {
     throw new Error("ssh run workspace retention supports dry-run mode only in this version");
   }
   const listNames =
-    input.listNames ?? (() => listSshRunWorkspaceNames({ spec: input.spec, runsRoot: input.runsRoot }));
+    input.listNames ?? (() => listSshRunWorkspaceNames({ spec: input.spec, runsRoot: input.runsRoot, timeoutMs: clampTimeoutMs(30_000) }));
   const listSizes =
     input.listSizes ??
-    ((runIds: string[]) => sizeSshRunWorkspaces({ spec: input.spec, runsRoot: input.runsRoot, runIds }));
+    ((runIds: string[]) => sizeSshRunWorkspaces({ spec: input.spec, runsRoot: input.runsRoot, runIds, timeoutMs: clampTimeoutMs(30_000) }));
   const excluded = new Set(input.excludeRunIds ?? []);
+  const notes: string[] = [];
+  const budgetDeferred: SshRunRetentionBatchDeferral[] = [];
+
+  if (remainingBudgetMs() <= 0) {
+    return {
+      mode: "dry-run",
+      policyRevision: input.policy.policyRevision,
+      runsRoot: input.runsRoot,
+      scannedAtMs: startedAtMs,
+      elapsedMs: elapsedMs(),
+      scanned: 0,
+      plannedBytes: 0,
+      decisions: [],
+      deferred: [],
+      notes: ["time budget exhausted before the metadata scan: nothing scanned"],
+    };
+  }
 
   // Metadata-first: names and mtimes for everything, then bytes only for the
   // bounded shortlist (oldest first, ~2x the batch cap so the byte and time
@@ -478,7 +511,15 @@ export async function sweepSshRunWorkspacesMetadataOnly(input: {
   const shortlist = candidates
     .slice(0, Math.max(input.policy.maxBatchDirs * 2, input.policy.maxBatchDirs))
     .map((entry) => entry.runId);
-  const sizes = await listSizes(shortlist);
+  let sizes = new Map<string, number>();
+  if (remainingBudgetMs() > 0) {
+    sizes = await listSizes(shortlist);
+  } else {
+    notes.push("time budget exhausted before sizing: shortlist deferred");
+    for (const runId of shortlist) {
+      budgetDeferred.push({ runId, reason: "time_budget" });
+    }
+  }
   const sizedCandidates: SshRunRetentionCandidate[] = [];
   for (const entry of candidates) {
     const bytes = sizes.get(entry.runId);
@@ -488,31 +529,39 @@ export async function sweepSshRunWorkspacesMetadataOnly(input: {
 
   // Resolve eligibility for the shortlist before planning so each decision is
   // taken once, with evidence. Replay receipts keep their recorded decision.
+  // The clock is re-read between calls: once the budget is spent, the
+  // remaining candidates are deferred rather than decided on stale time.
   const eligibilityByRun = new Map<string, SshRunRetentionEligibilityInput>();
-  if (input.eligibility) {
-    for (const candidate of sizedCandidates) {
+  const plannableCandidates: SshRunRetentionCandidate[] = [];
+  for (const candidate of sizedCandidates) {
+    if (input.eligibility && remainingBudgetMs() <= 0) {
+      budgetDeferred.push({ runId: candidate.runId, reason: "time_budget" });
+      continue;
+    }
+    if (input.eligibility) {
       eligibilityByRun.set(candidate.runId, await input.eligibility(candidate));
     }
+    plannableCandidates.push(candidate);
   }
-  const evidenceCandidates: SshRunRetentionCandidate[] = sizedCandidates.map((candidate) => ({
+  const evidenceCandidates: SshRunRetentionCandidate[] = plannableCandidates.map((candidate) => ({
     ...candidate,
     eligibility: eligibilityByRun.get(candidate.runId) ?? {},
   }));
 
-  const startMs = nowMs;
   const plan = planSshRunWorkspaceRetentionBatch({
     candidates: evidenceCandidates,
     policy: input.policy,
-    nowMs,
+    nowMs: now(),
     receipts: input.receipts,
-    elapsedMs: 0,
+    elapsedMs: elapsedMs(),
   });
 
   return {
     mode: "dry-run",
     policyRevision: input.policy.policyRevision,
     runsRoot: input.runsRoot,
-    scannedAtMs: startMs,
+    scannedAtMs: startedAtMs,
+    elapsedMs: elapsedMs(),
     scanned: names.length,
     plannedBytes: plan.plannedBytes,
     decisions: plan.entries.map((entry) => ({
@@ -524,7 +573,7 @@ export async function sweepSshRunWorkspacesMetadataOnly(input: {
       idempotencyKey: entry.idempotencyKey,
       replayed: entry.replayed,
     })),
-    deferred: plan.deferred,
-    notes: input.eligibility ? [] : ["no eligibility provider: every new decision is SKIP api_incomplete by design"],
+    deferred: [...budgetDeferred, ...plan.deferred],
+    notes: input.eligibility ? notes : [...notes, "no eligibility provider: every new decision is SKIP api_incomplete by design"],
   };
 }

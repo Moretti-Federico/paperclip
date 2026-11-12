@@ -1352,6 +1352,61 @@ describe("ssh env-lab fixture", () => {
     expect(slimBytes).toBeLessThan(fullBytes * 0.3);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
 
+  it("expands bare-name excludes to any depth and drops unsupported globs on the non-Git path: no restore loss, globs never applied", async () => {
+    const rootDir = await createFixtureRootDir();
+    const homeWorkspace = path.join(rootDir, "agent-home");
+
+    // Nested dependency tree (monorepo shape) plus glob-shaped caller input.
+    await mkdir(path.join(homeWorkspace, "packages", "a", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(homeWorkspace, "logs", "deep"), { recursive: true });
+    await writeFile(path.join(homeWorkspace, "notes.md"), "relevant\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "packages", "a", "node_modules", "dep", "index.js"), Buffer.alloc(256 * 1024, 5));
+    await writeFile(path.join(homeWorkspace, "logs", "build.log"), "build log\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "logs", "deep", "nested.log"), "nested log\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "non-Git exclude canonicalization test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    // The exact caller form that previously diverged between tar (any depth)
+    // and the baseline matcher (root-anchored), plus a glob shape that the
+    // baseline matcher cannot reproduce and that must be dropped fail-closed.
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "canonical-excludes", adapterKey: "test-adapter", workspaceLocalDir: homeWorkspace,
+      workspaceExclude: ["node_modules", "node_modules/*", "*.log"],
+    });
+
+    const remoteProbe = async (relative: string) => {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, ...relative.split("/")))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return probe.stdout.trim();
+    };
+    // The bare name was expanded to any depth: the nested tree never reached
+    // the remote copy…
+    expect(await remoteProbe("packages/a/node_modules/dep/index.js")).toBe("absent");
+    // …while the unsupported glob was dropped, so .log files ARE transferred
+    // (and therefore baseline-tracked, never restore-time deletions).
+    expect(await remoteProbe("logs/build.log")).toBe("present");
+    expect(await remoteProbe("logs/deep/nested.log")).toBe("present");
+
+    await runSshCommand(
+      config,
+      `printf 'remote work\\n' > ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, "notes.md"))}`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+    await expect(readFile(path.join(homeWorkspace, "notes.md"), "utf8")).resolves.toBe("remote work\n");
+    // No-loss gate: the excluded nested file survives restore byte-identically
+    // instead of being deleted as a "missing at the source" baseline entry.
+    await expect(readFile(path.join(homeWorkspace, "packages", "a", "node_modules", "dep", "index.js"))).resolves.toEqual(Buffer.alloc(256 * 1024, 5));
+    await expect(readFile(path.join(homeWorkspace, "logs", "build.log"), "utf8")).resolves.toBe("build log\n");
+    await expect(readFile(path.join(homeWorkspace, "logs", "deep", "nested.log"), "utf8")).resolves.toBe("nested log\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
   it("applies coherent workspace excludes on the Git path: .gitignore alone is not enough, the overlay drops node_modules, restore loses nothing", async () => {
     const rootDir = await createFixtureRootDir();
     const localRepo = path.join(rootDir, "local-workspace");
@@ -1408,6 +1463,63 @@ describe("ssh env-lab fixture", () => {
     expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
     await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("remote\n");
     await expect(readFile(path.join(localRepo, "node_modules", "dep.bin"))).resolves.toEqual(Buffer.alloc(512 * 1024, 3));
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("expands bare-name excludes to any depth and drops unsupported globs on the Git path: nested node_modules and logs never lost at restore", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\n*.log\n", "utf8");
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", ".gitignore", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+    // Monorepo-shaped nested dependency tree and glob-matching log files,
+    // both untracked: only the overlay (not .gitignore) controls their
+    // transfer, and only the canonicalized exclude list controls the baseline.
+    await mkdir(path.join(localRepo, "packages", "a", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(localRepo, "logs", "deep"), { recursive: true });
+    await writeFile(path.join(localRepo, "packages", "a", "node_modules", "dep", "index.js"), Buffer.alloc(256 * 1024, 6));
+    await writeFile(path.join(localRepo, "logs", "build.log"), "build log\n", "utf8");
+    await writeFile(path.join(localRepo, "logs", "deep", "nested.log"), "nested log\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "Git-path exclude canonicalization test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "git-canonical-excludes", adapterKey: "test-adapter", workspaceLocalDir: localRepo,
+      workspaceExclude: ["node_modules", "node_modules/*", "*.log"],
+    });
+
+    const remoteProbe = async (relative: string) => {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, ...relative.split("/")))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return probe.stdout.trim();
+    };
+    expect(await remoteProbe("packages/a/node_modules/dep/index.js")).toBe("absent");
+    expect(await remoteProbe("logs/build.log")).toBe("present");
+    expect(await remoteProbe("logs/deep/nested.log")).toBe("present");
+
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(prepared.workspaceRemoteDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && printf "remote\\n" > tracked.txt && git add tracked.txt && git commit -m "remote update" >/dev/null`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("remote\n");
+    await expect(readFile(path.join(localRepo, "packages", "a", "node_modules", "dep", "index.js"))).resolves.toEqual(Buffer.alloc(256 * 1024, 6));
+    await expect(readFile(path.join(localRepo, "logs", "build.log"), "utf8")).resolves.toBe("build log\n");
+    await expect(readFile(path.join(localRepo, "logs", "deep", "nested.log"), "utf8")).resolves.toBe("nested log\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
 
   it("runs the dry-run retention sweep on real SSH after restore: SKIP api_incomplete, current run excluded, nothing touched", async () => {

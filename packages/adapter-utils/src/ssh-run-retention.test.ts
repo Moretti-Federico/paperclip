@@ -357,4 +357,76 @@ describe("sweepSshRunWorkspacesMetadataOnly (local fixture)", () => {
     // Dry-run means dry-run: the trees still exist, untouched.
     await expect(stat(path.join(runsRoot, "eligible-run"))).resolves.toBeTruthy();
   });
+
+  it("measures the budget with the real clock: an eligibility call that exhausts it defers every remaining candidate", async () => {
+    const runsRoot = await createRunsRoot([
+      { runId: "slow-evidence", ageHours: 96 },
+      { runId: "younger-run", ageHours: 72 },
+    ]);
+    let clock = NOW_MS;
+    const manifest = await sweepSshRunWorkspacesMetadataOnly({
+      spec: { host: "unused", port: 1, username: "u", remoteWorkspacePath: "/x", remoteCwd: "/x", privateKey: null, knownHosts: null, strictHostKeyChecking: false },
+      runsRoot,
+      policy: POLICY,
+      now: () => clock,
+      ...localListing(runsRoot),
+      eligibility: async (entry) => {
+        if (entry.runId === "slow-evidence") clock += POLICY.timeBudgetMs + 1000;
+        return FULL_ELIGIBILITY;
+      },
+    });
+    // The clock is real: the 31s eligibility call spends the whole budget, so
+    // nothing is decided afterwards — not even the already-evidenced
+    // candidate — and everything is deferred with `time_budget`.
+    expect(manifest.decisions).toEqual([]);
+    expect(manifest.deferred).toContainEqual({ runId: "younger-run", reason: "time_budget" });
+    expect(manifest.deferred).toContainEqual({ runId: "slow-evidence", reason: "time_budget" });
+    expect(manifest.elapsedMs).toBe(POLICY.timeBudgetMs + 1000);
+  });
+
+  it("defers all candidates with time_budget when sizing exhausts the clock", async () => {
+    const runsRoot = await createRunsRoot([
+      { runId: "oldest-run", ageHours: 96 },
+      { runId: "next-run", ageHours: 72 },
+    ]);
+    let clock = NOW_MS;
+    const manifest = await sweepSshRunWorkspacesMetadataOnly({
+      spec: { host: "unused", port: 1, username: "u", remoteWorkspacePath: "/x", remoteCwd: "/x", privateKey: null, knownHosts: null, strictHostKeyChecking: false },
+      runsRoot,
+      policy: POLICY,
+      now: () => clock,
+      listNames: () => listLocalRunWorkspaceNames({ runsRoot }),
+      listSizes: async (runIds) => {
+        clock += POLICY.timeBudgetMs + 1000;
+        return sizeLocalRunWorkspaces({ runsRoot, runIds });
+      },
+    });
+    expect(manifest.decisions).toEqual([]);
+    for (const runId of ["oldest-run", "next-run"]) {
+      expect(manifest.deferred).toContainEqual({ runId, reason: "time_budget" });
+    }
+    expect(manifest.elapsedMs).toBe(POLICY.timeBudgetMs + 1000);
+  });
+
+  it("skips sizing and defers the shortlist when the budget is spent right after the name listing", async () => {
+    const runsRoot = await createRunsRoot([{ runId: "listed-run", ageHours: 96 }]);
+    let clock = NOW_MS;
+    const manifest = await sweepSshRunWorkspacesMetadataOnly({
+      spec: { host: "unused", port: 1, username: "u", remoteWorkspacePath: "/x", remoteCwd: "/x", privateKey: null, knownHosts: null, strictHostKeyChecking: false },
+      runsRoot,
+      policy: POLICY,
+      now: () => clock,
+      listNames: async () => {
+        clock += POLICY.timeBudgetMs + 1000;
+        return listLocalRunWorkspaceNames({ runsRoot });
+      },
+      listSizes: () => {
+        throw new Error("sizing must not run once the budget is spent");
+      },
+    });
+    expect(manifest.decisions).toEqual([]);
+    expect(manifest.deferred).toEqual([{ runId: "listed-run", reason: "time_budget" }]);
+    expect(manifest.scanned).toBe(1);
+    expect(manifest.notes).toContain("time budget exhausted before sizing: shortlist deferred");
+  });
 });

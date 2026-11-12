@@ -1642,30 +1642,67 @@ export async function syncDirectoryFromSsh(input: {
 
 /**
  * Normalizes caller-provided workspace exclude patterns into the effective
- * transfer exclude list. Patterns are matched by the local `tar` overlay
- * (`--exclude`) and by the baseline snapshot walk
- * (`excludePatternMatches`), so both engines must see the same strings.
- * Absolute paths, parent-relative escapes, and empty segments are dropped:
- * excludes are workspace-relative by contract.
+ * transfer exclude list. One canonical list feeds every engine that must
+ * agree: the upload tar overlay (`--exclude`), the baseline snapshot walk
+ * (`excludePatternMatches`), and the restore download tar. Only shapes whose
+ * tar match set is covered by `excludePatternMatches` are accepted:
+ *
+ * - a bare literal name `X` (no slash, no glob metacharacters) is expanded
+ *   to the four equivalent forms `X`, "X slash star", "star slash X", "star
+ *   slash X slash star": tar matches a bare name at any depth, and the
+ *   expansion reproduces exactly that in the baseline matcher;
+ * - rooted literal paths and their trailing "slash star" contents form stay
+ *   as-is: both engines anchor them at the workspace root;
+ * - the any-depth forms (a leading "star slash" prefix) stay as-is: the
+ *   matcher's any-depth reading covers everything tar's anchored glob can
+ *   match;
+ * - anything else is dropped. Glob patterns such as `*.log` or a `dist`
+ *   contents glob are interpreted by tar but not by the baseline matcher, so
+ *   such an exclude would leave the file in the baseline while the upload
+ *   omitted it — and the restore merge would then delete the local file.
+ *   Dropping an exclude only transfers more files; it can never lose data.
+ *
+ * Absolute paths, parent-relative escapes (a `..` segment), and empty
+ * segments are likewise dropped: excludes are workspace-relative by
+ * contract.
  */
+function workspaceExcludePatternForms(pattern: string): string[] | null {
+  const trimmed = pattern.trim();
+  if (trimmed.length === 0 || trimmed.startsWith("/")) return null;
+  let core = trimmed;
+  let anyDepth = false;
+  if (core.startsWith("*/")) {
+    anyDepth = true;
+    core = core.slice(2);
+  }
+  let contentsOnly = false;
+  if (core.endsWith("/*")) {
+    contentsOnly = true;
+    core = core.slice(0, -2);
+  }
+  if (core.length === 0 || /[*?[\]]/.test(core)) return null;
+  const segments = core.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) return null;
+  // A bare literal name needs the four-form expansion: tar matches bare
+  // names at any depth, while the unexpanded matcher form is root-anchored.
+  if (!anyDepth && !contentsOnly && segments.length === 1) {
+    return [core, `${core}/*`, `*/${core}`, `*/${core}/*`];
+  }
+  return [trimmed];
+}
+
 function sanitizeWorkspaceExcludePatterns(patterns: string[] | undefined): string[] {
   if (!patterns) return [];
   const seen = new Set<string>();
   const result: string[] = [];
   for (const pattern of patterns) {
-    const trimmed = pattern.trim();
-    if (
-      trimmed.length === 0 ||
-      trimmed === "." ||
-      trimmed === ".." ||
-      trimmed.startsWith("/") ||
-      trimmed.startsWith("..")
-    ) {
-      continue;
+    const forms = workspaceExcludePatternForms(pattern);
+    if (!forms) continue;
+    for (const form of forms) {
+      if (seen.has(form)) continue;
+      seen.add(form);
+      result.push(form);
     }
-    if (seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    result.push(trimmed);
   }
   return result;
 }
