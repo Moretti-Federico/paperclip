@@ -1658,14 +1658,19 @@ export async function syncDirectoryFromSsh(input: {
  *   --wildcards --wildcards-match-slash`), so these shapes also match
  *   nested `pkg/dist/cache/...`, and only the companion form reproduces
  *   that coverage in the baseline matcher;
- * - the any-depth forms (a leading "star slash" prefix) stay as-is: the
- *   matcher's any-depth reading covers everything tar's anchored glob can
- *   match;
+ * - the any-depth forms (a leading "star slash" prefix) stay as-is: tar
+ *   applies its exclude patterns un-anchored here, and the matcher's
+ *   any-depth reading of the leading prefix covers that same match set;
  * - anything else is dropped. Glob patterns such as `*.log` or a `dist`
  *   contents glob are interpreted by tar but not by the baseline matcher, so
  *   such an exclude would leave the file in the baseline while the upload
  *   omitted it — and the restore merge would then delete the local file.
- *   Dropping an exclude only transfers more files; it can never lose data.
+ *   Patterns containing a backslash are dropped for the same reason: GNU tar
+ *   reads a backslash as an escape (an `a\b` pattern matches `ab`, and
+ *   `dist\cache` matches `distcache`), while the baseline matcher compares
+ *   backslashes literally, so the two engines can never agree on such a
+ *   pattern. Dropping an exclude only transfers more files; it can never
+ *   lose data.
  *
  * Absolute paths, parent-relative escapes (a `..` segment), and empty
  * segments are likewise dropped: excludes are workspace-relative by
@@ -1674,6 +1679,11 @@ export async function syncDirectoryFromSsh(input: {
 export function workspaceExcludePatternForms(pattern: string): string[] | null {
   const trimmed = pattern.trim();
   if (trimmed.length === 0 || trimmed.startsWith("/")) return null;
+  // GNU tar reads a backslash in an exclude pattern as an escape (`a\b`
+  // matches `ab`, `dist\cache` matches `distcache`), while the baseline
+  // matcher compares backslashes literally: the engines cannot agree, so
+  // drop such patterns fail-closed (dropping only transfers more files).
+  if (trimmed.includes("\\")) return null;
   let core = trimmed;
   let anyDepth = false;
   if (core.startsWith("*/")) {

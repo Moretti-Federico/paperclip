@@ -73,7 +73,8 @@ not regress that test.
 
 `prepareWorkspaceForSshExecution` and `prepareRemoteManagedRuntime` accept a
 `workspaceExclude` pattern list. The patterns are workspace-relative (absolute
-paths, parent-relative `..` segments, and empty segments are dropped) and are
+paths, parent-relative `..` segments, empty segments, and patterns containing
+a backslash are dropped) and are
 interpreted identically on the Git and non-Git paths, in every file mode:
 
 - **upload**: the working-tree overlay (`tar`) skips the excluded paths. On
@@ -112,6 +113,9 @@ because tar excludes globs while the baseline matches literal rooted paths:
 - **any other pattern is dropped** (fail closed): glob patterns such as
   `*.log` or `dist/*.map` are matched by tar but not by the baseline matcher,
   so applying them would delete the matching local files at restore time.
+  Patterns containing a backslash are dropped for the same reason: GNU tar
+  reads a backslash as an escape (`a\b` matches `ab`, `dist\cache` matches
+  `distcache`), while the baseline matcher compares backslashes literally.
   Dropping an exclude only transfers more files; it can never lose data.
 
 Passing `node_modules` alone is therefore sufficient (and equivalent to
