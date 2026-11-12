@@ -1640,6 +1640,36 @@ export async function syncDirectoryFromSsh(input: {
   }
 }
 
+/**
+ * Normalizes caller-provided workspace exclude patterns into the effective
+ * transfer exclude list. Patterns are matched by the local `tar` overlay
+ * (`--exclude`) and by the baseline snapshot walk
+ * (`excludePatternMatches`), so both engines must see the same strings.
+ * Absolute paths, parent-relative escapes, and empty segments are dropped:
+ * excludes are workspace-relative by contract.
+ */
+function sanitizeWorkspaceExcludePatterns(patterns: string[] | undefined): string[] {
+  if (!patterns) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const pattern of patterns) {
+    const trimmed = pattern.trim();
+    if (
+      trimmed.length === 0 ||
+      trimmed === "." ||
+      trimmed === ".." ||
+      trimmed.startsWith("/") ||
+      trimmed.startsWith("..")
+    ) {
+      continue;
+    }
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -1647,11 +1677,25 @@ export async function prepareWorkspaceForSshExecution(input: {
   onProgress?: RuntimeProgressSink;
   workspaceFileMode?: "all";
   workspaceExclude?: string[];
-}): Promise<{ gitBacked: boolean; repositories?: string[]; excludedPaths?: string[] }> {
+}): Promise<{
+  gitBacked: boolean;
+  repositories?: string[];
+  excludedPaths?: string[];
+  /**
+   * The sanitized workspace-level exclude patterns the upload actually
+   * applied, on both the Git and non-Git paths. Callers that snapshot a
+   * baseline for restore MUST use this list verbatim so a file excluded
+   * from the upload is also excluded from the baseline — and therefore
+   * never treated as deleted-at-restore time.
+   */
+  transferExclude?: string[];
+}> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
   const excludedPaths = await listProjectRepositoryStagingPaths(input.localDir);
   const excludedResult = excludedPaths.length > 0 ? { excludedPaths } : {};
+  const workspaceExclude = sanitizeWorkspaceExcludePatterns(input.workspaceExclude);
+  const transferExcludeResult = workspaceExclude.length > 0 ? { transferExclude: workspaceExclude } : {};
 
   if (gitSnapshot) {
     const repositories = await listLocalProjectRepositories(input.localDir);
@@ -1660,7 +1704,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       localDir: input.localDir,
       remoteDir,
       snapshot: gitSnapshot,
-      exclude: repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : excludedPaths,
+      exclude: [...(repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : excludedPaths), ...workspaceExclude],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1680,7 +1724,12 @@ export async function prepareWorkspaceForSshExecution(input: {
         progressLabel: relative,
       });
     }
-    return { gitBacked: true, ...(repositories.length > 0 ? { repositories } : {}), ...excludedResult };
+    return {
+      gitBacked: true,
+      ...(repositories.length > 0 ? { repositories } : {}),
+      ...excludedResult,
+      ...transferExcludeResult,
+    };
   }
 
   await clearRemoteDirectory({
@@ -1692,11 +1741,11 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime", ...excludedPaths, ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+    exclude: [".paperclip-runtime", ...excludedPaths, ...workspaceExclude],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
-  return { gitBacked: false, ...excludedResult };
+  return { gitBacked: false, ...excludedResult, ...transferExcludeResult };
 }
 
 export async function restoreWorkspaceFromSshExecution(input: {
