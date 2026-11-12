@@ -15,6 +15,13 @@ import {
 } from "./sandbox-managed-runtime.js";
 import { captureDirectorySnapshot, type DirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
+import {
+  sweepSshRunWorkspacesMetadataOnly,
+  type SshRunRetentionEligibilityInput,
+  type SshRunRetentionReceipt,
+  type SshRunWorkspaceRetentionManifest,
+  type SshRunWorkspaceRetentionPolicy,
+} from "./ssh-run-retention.js";
 
 // The fixed heavy-directory excludes every referenced project drops,
 // regardless of its ignore resolution. A `git`-resolved project additionally
@@ -39,6 +46,19 @@ export interface RemoteManagedRuntimeAsset {
   followSymlinks?: boolean;
   exclude?: string[];
   restore?: (ctx: SandboxManagedRuntimeAssetRestoreContext) => Promise<void>;
+}
+
+/**
+ * Dry-run retention sweep attached to the run's real finalization event: the
+ * completion of the SSH workspace restore at teardown. Inert unless a policy
+ * with `enabled: true` is provided; no caller passes one today. The sweep is
+ * metadata-only and can never fail the run.
+ */
+export interface RemoteManagedRunRetentionOptions {
+  policy: SshRunWorkspaceRetentionPolicy;
+  receipts?: SshRunRetentionReceipt[];
+  eligibility?: (candidate: { runId: string; bytes: number; newestMtimeMs: number }) => Promise<SshRunRetentionEligibilityInput>;
+  onManifest?: (manifest: SshRunWorkspaceRetentionManifest) => void | Promise<void>;
 }
 
 export interface PreparedRemoteManagedRuntime {
@@ -118,6 +138,12 @@ export async function prepareRemoteManagedRuntime(input: {
   assets?: RemoteManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
+  /**
+   * Optional dry-run retention sweep for previous `<remoteCwd>/.paperclip-runtime/runs/*`
+   * trees, evaluated after this run's workspace restore completes. Default
+   * (omitted or disabled): nothing runs.
+   */
+  runRetention?: RemoteManagedRunRetentionOptions;
   // Upload progress sink. Threaded for the byte-counting transport rewrite; the
   // child task wires it into the workspace/asset transfers.
   onProgress?: RuntimeProgressSink;
@@ -146,6 +172,11 @@ export async function prepareRemoteManagedRuntime(input: {
       })
     : null;
   const projectRepositories = preparedWorkspace?.repositories ?? [];
+  // Single source of truth: the baseline must exclude exactly what the upload
+  // excluded (the upload's effective transfer excludes). A file excluded from
+  // the upload is therefore absent from the baseline and is never treated as
+  // deleted-at-restore time — it survives restore untouched.
+  const transferExclude = preparedWorkspace?.transferExclude ?? [];
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
@@ -153,8 +184,9 @@ export async function prepareRemoteManagedRuntime(input: {
               ...GIT_ARCHIVE_EXCLUDES,
               ".paperclip-runtime",
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : preparedWorkspace.excludedPaths ?? []),
+              ...transferExclude,
             ]
-          : [".paperclip-runtime", ...(preparedWorkspace.excludedPaths ?? []), ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          : [".paperclip-runtime", ...(preparedWorkspace.excludedPaths ?? []), ...transferExclude],
       })
     : null;
   const repositoryBaselines: Array<{ path: string; baselineSnapshot: DirectorySnapshot }> = [];
@@ -268,6 +300,29 @@ export async function prepareRemoteManagedRuntime(input: {
           assetDir: path.posix.join(runtimeRootDir, asset.key),
           readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
         });
+      }
+      if (input.runRetention?.policy.enabled) {
+        // Finalization-anchored, metadata-only, and best-effort: a retention
+        // sweep can never fail the run it closes.
+        try {
+          const manifest = await sweepSshRunWorkspacesMetadataOnly({
+            spec: input.spec,
+            runsRoot: path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs"),
+            policy: input.runRetention.policy,
+            receipts: input.runRetention.receipts,
+            excludeRunIds: [input.runId],
+            eligibility: input.runRetention.eligibility,
+          });
+          if (input.runRetention.onManifest) {
+            await input.runRetention.onManifest(manifest);
+          } else {
+            console.log(
+              `[paperclip] ssh run workspace retention dry-run: mode=${manifest.mode} scanned=${manifest.scanned} decisions=${manifest.decisions.length} deferred=${manifest.deferred.length}`,
+            );
+          }
+        } catch (error) {
+          console.warn(`[paperclip] ssh run workspace retention dry-run failed: ${String(error)}`);
+        }
       }
     },
   };

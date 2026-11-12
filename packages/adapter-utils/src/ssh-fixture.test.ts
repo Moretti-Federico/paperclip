@@ -19,6 +19,7 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import type { SshRunWorkspaceRetentionManifest, SshRunWorkspaceRetentionPolicy } from "./ssh-run-retention.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 const UNREACHABLE_SSH_SPEC = {
@@ -91,6 +92,10 @@ async function git(cwd: string, args: string[]): Promise<string> {
       resolve(stdout.trim());
     });
   });
+}
+
+function statePathOf(rootDir: string): string {
+  return path.join(rootDir, "state.json");
 }
 
 // Finds the pid of a running sshd process by its config file path, the same
@@ -1275,4 +1280,409 @@ describe("ssh env-lab fixture", () => {
     expect(recentSubjects).toContain("remote update a");
     expect(recentSubjects).toContain("remote update b");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("applies coherent workspace excludes on the non-Git path: no upload, no baseline entry, no restore loss, >=70% fewer bytes", async () => {
+    const rootDir = await createFixtureRootDir();
+    const homeWorkspace = path.join(rootDir, "agent-home");
+
+    // An agent-home-like source: the mandate-relevant content is small, while
+    // regenerable dependencies and an unrelated repository dominate the bytes.
+    await mkdir(path.join(homeWorkspace, "current-project"), { recursive: true });
+    await mkdir(path.join(homeWorkspace, "node_modules", ".store"), { recursive: true });
+    await mkdir(path.join(homeWorkspace, "unrelated-repo"), { recursive: true });
+    await writeFile(path.join(homeWorkspace, "mandate-notes.md"), "coordination notes\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "current-project", "plan.md"), "slim relevant payload\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "node_modules", ".store", "dep.bin"), Buffer.alloc(3 * 1024 * 1024, 7));
+    await writeFile(path.join(homeWorkspace, "unrelated-repo", "README.md"), "unrelated\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "unrelated-repo", "objects.pack"), Buffer.alloc(3 * 1024 * 1024, 9));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "coherent non-Git excludes test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const remoteBytes = async (remoteDir: string) => {
+      const result = await runSshCommand(
+        config,
+        `du -sb --exclude=.paperclip-runtime ${JSON.stringify(remoteDir)} | cut -f1`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return Number(result.stdout.trim());
+    };
+
+    // Reference upload with today's default behavior (no excludes).
+    const preparedFull = await prepareRemoteManagedRuntime({
+      spec, runId: "full-copy", adapterKey: "test-adapter", workspaceLocalDir: homeWorkspace,
+    });
+    const fullBytes = await remoteBytes(preparedFull.workspaceRemoteDir);
+
+    // Coherent upload with explicit regenerable/unrelated excludes.
+    const excludes = ["node_modules", "node_modules/*", "unrelated-repo", "unrelated-repo/*"];
+    const preparedSlim = await prepareRemoteManagedRuntime({
+      spec, runId: "slim-copy", adapterKey: "test-adapter", workspaceLocalDir: homeWorkspace,
+      workspaceExclude: excludes,
+    });
+    const slimBytes = await remoteBytes(preparedSlim.workspaceRemoteDir);
+
+    // The excluded trees never reached the remote copy.
+    for (const excluded of ["node_modules", "unrelated-repo"]) {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(preparedSlim.workspaceRemoteDir, excluded))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      expect(probe.stdout.trim()).toBe("absent");
+    }
+
+    // Remote work on the relevant content must round-trip; excluded local
+    // content must survive restore byte-identically (no-loss gate).
+    await runSshCommand(
+      config,
+      `printf 'remote work\\n' > ${JSON.stringify(path.posix.join(preparedSlim.workspaceRemoteDir, "current-project", "result.txt"))}`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    await preparedSlim.restoreWorkspace();
+    await expect(readFile(path.join(homeWorkspace, "current-project", "result.txt"), "utf8")).resolves.toBe("remote work\n");
+    await expect(readFile(path.join(homeWorkspace, "mandate-notes.md"), "utf8")).resolves.toBe("coordination notes\n");
+    await expect(readFile(path.join(homeWorkspace, "node_modules", ".store", "dep.bin"))).resolves.toEqual(Buffer.alloc(3 * 1024 * 1024, 7));
+    await expect(readFile(path.join(homeWorkspace, "unrelated-repo", "objects.pack"))).resolves.toEqual(Buffer.alloc(3 * 1024 * 1024, 9));
+
+    // Quantitative gate for the reducible class: at least a 70% byte cut on
+    // this fixture (observed value recorded in the implementation report).
+    expect(slimBytes).toBeLessThan(fullBytes * 0.3);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("expands bare-name excludes to any depth and drops unsupported globs on the non-Git path: no restore loss, globs never applied", async () => {
+    const rootDir = await createFixtureRootDir();
+    const homeWorkspace = path.join(rootDir, "agent-home");
+
+    // Nested dependency tree (monorepo shape) plus glob-shaped caller input.
+    await mkdir(path.join(homeWorkspace, "packages", "a", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(homeWorkspace, "logs", "deep"), { recursive: true });
+    await writeFile(path.join(homeWorkspace, "notes.md"), "relevant\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "packages", "a", "node_modules", "dep", "index.js"), Buffer.alloc(256 * 1024, 5));
+    await writeFile(path.join(homeWorkspace, "logs", "build.log"), "build log\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "logs", "deep", "nested.log"), "nested log\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "non-Git exclude canonicalization test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    // The exact caller form that previously diverged between tar (any depth)
+    // and the baseline matcher (root-anchored), plus a glob shape that the
+    // baseline matcher cannot reproduce and that must be dropped fail-closed.
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "canonical-excludes", adapterKey: "test-adapter", workspaceLocalDir: homeWorkspace,
+      workspaceExclude: ["node_modules", "node_modules/*", "*.log"],
+    });
+
+    const remoteProbe = async (relative: string) => {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, ...relative.split("/")))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return probe.stdout.trim();
+    };
+    // The bare name was expanded to any depth: the nested tree never reached
+    // the remote copy…
+    expect(await remoteProbe("packages/a/node_modules/dep/index.js")).toBe("absent");
+    // …while the unsupported glob was dropped, so .log files ARE transferred
+    // (and therefore baseline-tracked, never restore-time deletions).
+    expect(await remoteProbe("logs/build.log")).toBe("present");
+    expect(await remoteProbe("logs/deep/nested.log")).toBe("present");
+
+    await runSshCommand(
+      config,
+      `printf 'remote work\\n' > ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, "notes.md"))}`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+    await expect(readFile(path.join(homeWorkspace, "notes.md"), "utf8")).resolves.toBe("remote work\n");
+    // No-loss gate: the excluded nested file survives restore byte-identically
+    // instead of being deleted as a "missing at the source" baseline entry.
+    await expect(readFile(path.join(homeWorkspace, "packages", "a", "node_modules", "dep", "index.js"))).resolves.toEqual(Buffer.alloc(256 * 1024, 5));
+    await expect(readFile(path.join(homeWorkspace, "logs", "build.log"), "utf8")).resolves.toBe("build log\n");
+    await expect(readFile(path.join(homeWorkspace, "logs", "deep", "nested.log"), "utf8")).resolves.toBe("nested log\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("pairs rooted exclude forms with their any-depth companions on the non-Git path: nested dist/cache and node_modules contents never lost at restore", async () => {
+    const rootDir = await createFixtureRootDir();
+    const homeWorkspace = path.join(rootDir, "agent-home");
+
+    // The exact rooted shapes tar applies un-anchored (any depth) while the
+    // unaccompanied matcher forms would anchor at the workspace root.
+    await mkdir(path.join(homeWorkspace, "packages", "a", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(homeWorkspace, "packages", "a", "dist", "cache"), { recursive: true });
+    await writeFile(path.join(homeWorkspace, "notes.md"), "relevant\n", "utf8");
+    await writeFile(path.join(homeWorkspace, "packages", "a", "node_modules", "dep", "index.js"), Buffer.alloc(256 * 1024, 11));
+    await writeFile(path.join(homeWorkspace, "packages", "a", "dist", "cache", "x.bin"), Buffer.alloc(192 * 1024, 12));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "non-Git rooted exclude forms test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "rooted-form-excludes", adapterKey: "test-adapter", workspaceLocalDir: homeWorkspace,
+      workspaceExclude: ["node_modules/*", "dist/cache"],
+    });
+
+    const remoteProbe = async (relative: string) => {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, ...relative.split("/")))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return probe.stdout.trim();
+    };
+    // tar excludes both rooted shapes at any depth, so the nested files never
+    // reached the remote copy.
+    expect(await remoteProbe("packages/a/node_modules/dep/index.js")).toBe("absent");
+    expect(await remoteProbe("packages/a/dist/cache/x.bin")).toBe("absent");
+
+    await runSshCommand(
+      config,
+      `printf 'remote work\\n' > ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, "notes.md"))}`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+    await expect(readFile(path.join(homeWorkspace, "notes.md"), "utf8")).resolves.toBe("remote work\n");
+    // No-loss gate: the baseline matcher covers what un-anchored tar
+    // excluded, so the nested local files survive restore byte-identically
+    // instead of being deleted as "missing at the source" baseline entries.
+    await expect(readFile(path.join(homeWorkspace, "packages", "a", "node_modules", "dep", "index.js"))).resolves.toEqual(Buffer.alloc(256 * 1024, 11));
+    await expect(readFile(path.join(homeWorkspace, "packages", "a", "dist", "cache", "x.bin"))).resolves.toEqual(Buffer.alloc(192 * 1024, 12));
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("applies coherent workspace excludes on the Git path: .gitignore alone is not enough, the overlay drops node_modules, restore loses nothing", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\n", "utf8");
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", ".gitignore", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+    await mkdir(path.join(localRepo, "node_modules"), { recursive: true });
+    await writeFile(path.join(localRepo, "node_modules", "dep.bin"), Buffer.alloc(512 * 1024, 3));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "coherent Git-path excludes test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    // Reference behavior first: ignored files (node_modules) DO reach the
+    // remote copy today because the working-tree overlay ignores .gitignore.
+    const preparedFull = await prepareRemoteManagedRuntime({
+      spec, runId: "git-full", adapterKey: "test-adapter", workspaceLocalDir: localRepo,
+    });
+    const fullProbe = await runSshCommand(
+      config,
+      `test -d ${JSON.stringify(path.posix.join(preparedFull.workspaceRemoteDir, "node_modules"))} && echo present || echo absent`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    expect(fullProbe.stdout.trim()).toBe("present");
+
+    // With coherent excludes the overlay skips the ignored dependency tree.
+    const preparedSlim = await prepareRemoteManagedRuntime({
+      spec, runId: "git-slim", adapterKey: "test-adapter", workspaceLocalDir: localRepo,
+      workspaceExclude: ["node_modules", "node_modules/*"],
+    });
+    const slimProbe = await runSshCommand(
+      config,
+      `test -d ${JSON.stringify(path.posix.join(preparedSlim.workspaceRemoteDir, "node_modules"))} && echo present || echo absent`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    expect(slimProbe.stdout.trim()).toBe("absent");
+
+    // Remote commit round-trips through restore; the local ignored tree
+    // survives restore untouched.
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(preparedSlim.workspaceRemoteDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && printf "remote\\n" > tracked.txt && git add tracked.txt && git commit -m "remote update" >/dev/null`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    await preparedSlim.restoreWorkspace();
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("remote\n");
+    await expect(readFile(path.join(localRepo, "node_modules", "dep.bin"))).resolves.toEqual(Buffer.alloc(512 * 1024, 3));
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("expands bare-name excludes to any depth and drops unsupported globs on the Git path: nested node_modules and logs never lost at restore", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\n*.log\n", "utf8");
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", ".gitignore", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+    // Monorepo-shaped nested dependency tree and glob-matching log files,
+    // both untracked: only the overlay (not .gitignore) controls their
+    // transfer, and only the canonicalized exclude list controls the baseline.
+    await mkdir(path.join(localRepo, "packages", "a", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(localRepo, "logs", "deep"), { recursive: true });
+    await writeFile(path.join(localRepo, "packages", "a", "node_modules", "dep", "index.js"), Buffer.alloc(256 * 1024, 6));
+    await writeFile(path.join(localRepo, "logs", "build.log"), "build log\n", "utf8");
+    await writeFile(path.join(localRepo, "logs", "deep", "nested.log"), "nested log\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "Git-path exclude canonicalization test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "git-canonical-excludes", adapterKey: "test-adapter", workspaceLocalDir: localRepo,
+      workspaceExclude: ["node_modules", "node_modules/*", "*.log"],
+    });
+
+    const remoteProbe = async (relative: string) => {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, ...relative.split("/")))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return probe.stdout.trim();
+    };
+    expect(await remoteProbe("packages/a/node_modules/dep/index.js")).toBe("absent");
+    expect(await remoteProbe("logs/build.log")).toBe("present");
+    expect(await remoteProbe("logs/deep/nested.log")).toBe("present");
+
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(prepared.workspaceRemoteDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && printf "remote\\n" > tracked.txt && git add tracked.txt && git commit -m "remote update" >/dev/null`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("remote\n");
+    await expect(readFile(path.join(localRepo, "packages", "a", "node_modules", "dep", "index.js"))).resolves.toEqual(Buffer.alloc(256 * 1024, 6));
+    await expect(readFile(path.join(localRepo, "logs", "build.log"), "utf8")).resolves.toBe("build log\n");
+    await expect(readFile(path.join(localRepo, "logs", "deep", "nested.log"), "utf8")).resolves.toBe("nested log\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("pairs rooted exclude forms with their any-depth companions on the Git path: nested dist/cache and node_modules contents never lost at restore", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\ndist/\n", "utf8");
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", ".gitignore", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+    // Rooted exclude shapes on untracked nested trees: the overlay tar
+    // applies them un-anchored, so the baseline must match that coverage.
+    await mkdir(path.join(localRepo, "packages", "a", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(localRepo, "packages", "a", "dist", "cache"), { recursive: true });
+    await writeFile(path.join(localRepo, "packages", "a", "node_modules", "dep", "index.js"), Buffer.alloc(256 * 1024, 13));
+    await writeFile(path.join(localRepo, "packages", "a", "dist", "cache", "x.bin"), Buffer.alloc(192 * 1024, 14));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "Git-path rooted exclude forms test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "git-rooted-form-excludes", adapterKey: "test-adapter", workspaceLocalDir: localRepo,
+      workspaceExclude: ["node_modules/*", "dist/cache"],
+    });
+
+    const remoteProbe = async (relative: string) => {
+      const probe = await runSshCommand(
+        config,
+        `test -e ${JSON.stringify(path.posix.join(prepared.workspaceRemoteDir, ...relative.split("/")))} && echo present || echo absent`,
+        { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+      );
+      return probe.stdout.trim();
+    };
+    expect(await remoteProbe("packages/a/node_modules/dep/index.js")).toBe("absent");
+    expect(await remoteProbe("packages/a/dist/cache/x.bin")).toBe("absent");
+
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(prepared.workspaceRemoteDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && printf "remote\\n" > tracked.txt && git add tracked.txt && git commit -m "remote update" >/dev/null`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    await prepared.restoreWorkspace();
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("remote\n");
+    // No-loss gate on the Git path: un-anchored tar excludes are covered by
+    // the canonicalized baseline list, so restore never deletes them.
+    await expect(readFile(path.join(localRepo, "packages", "a", "node_modules", "dep", "index.js"))).resolves.toEqual(Buffer.alloc(256 * 1024, 13));
+    await expect(readFile(path.join(localRepo, "packages", "a", "dist", "cache", "x.bin"))).resolves.toEqual(Buffer.alloc(192 * 1024, 14));
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+  it("runs the dry-run retention sweep on real SSH after restore: SKIP api_incomplete, current run excluded, nothing touched", async () => {
+    const rootDir = await createFixtureRootDir();
+    const workspace = path.join(rootDir, "workspace");
+    await mkdir(workspace, { recursive: true });
+    await writeFile(path.join(workspace, "notes.txt"), "retention smoke\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePathOf(rootDir), "retention dry-run sweep test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const runsRoot = path.posix.join(started.workspaceDir, ".paperclip-runtime", "runs");
+    await runSshCommand(
+      config,
+      `mkdir -p ${JSON.stringify(path.posix.join(runsRoot, "old-run-a"))} ${JSON.stringify(path.posix.join(runsRoot, "old-run-b"))} && ` +
+        `printf payload > ${JSON.stringify(path.posix.join(runsRoot, "old-run-a", "f.bin"))} && ` +
+        `touch -d '3 days ago' ${JSON.stringify(path.posix.join(runsRoot, "old-run-a"))} ${JSON.stringify(path.posix.join(runsRoot, "old-run-b"))}`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+
+    const policy: SshRunWorkspaceRetentionPolicy = {
+      enabled: true,
+      mode: "dry-run",
+      minAgeHours: 48,
+      maxBatchDirs: 5,
+      maxBatchBytes: 1024 * 1024 * 1024,
+      timeBudgetMs: 30_000,
+      minQuarantineDays: 7,
+      runsWithoutIssue: "protected",
+      policyRevision: "1",
+    };
+    let manifest: SshRunWorkspaceRetentionManifest | null = null;
+    const prepared = await prepareRemoteManagedRuntime({
+      spec, runId: "retention-current", adapterKey: "test-adapter", workspaceLocalDir: workspace,
+      runRetention: { policy, onManifest: (result) => { manifest = result; } },
+    });
+    await prepared.restoreWorkspace();
+
+    expect(manifest).not.toBeNull();
+    const decisionsByRun = new Map(manifest!.decisions.map((entry) => [entry.runId, entry]));
+    expect(decisionsByRun.has("old-run-a")).toBe(true);
+    expect(decisionsByRun.has("old-run-b")).toBe(true);
+    // The adapter lane cannot prove eligibility, so every decision is a
+    // conservative SKIP until a Paperclip-side evidence provider exists.
+    for (const entry of manifest!.decisions) {
+      expect(entry.outcome).toBe("SKIP");
+      expect(entry.reason).toBe("api_incomplete");
+    }
+    expect(decisionsByRun.has("retention-current")).toBe(false);
+    expect(manifest!.mode).toBe("dry-run");
+
+    // Dry-run means dry-run: both stale trees still exist on the remote.
+    const probe = await runSshCommand(
+      config,
+      `test -d ${JSON.stringify(path.posix.join(runsRoot, "old-run-a"))} && test -d ${JSON.stringify(path.posix.join(runsRoot, "old-run-b"))} && echo intact || echo damaged`,
+      { timeoutMs: 30_000, maxBuffer: 64 * 1024 },
+    );
+    expect(probe.stdout.trim()).toBe("intact");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
 });

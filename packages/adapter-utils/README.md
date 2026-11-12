@@ -68,3 +68,94 @@ The invariant is pinned by the `no-remote-git contract` case in
 remote-only commit propagates to the local worktree through the
 prepare → restore round-trip with no git remote configured at any point. Do
 not regress that test.
+
+## Coherent workspace transfer excludes
+
+`prepareWorkspaceForSshExecution` and `prepareRemoteManagedRuntime` accept a
+`workspaceExclude` pattern list. The patterns are workspace-relative (absolute
+paths, parent-relative `..` segments, empty segments, and patterns containing
+a backslash are dropped) and are
+interpreted identically on the Git and non-Git paths, in every file mode:
+
+- **upload**: the working-tree overlay (`tar`) skips the excluded paths. On
+  the Git path the clean checkout from the imported history still happens
+  first; the excludes only remove content from the overlay that would
+  otherwise carry local ignored files (`.gitignore` alone does **not** keep
+  `node_modules` out of the copy, because the overlay tars the whole tree).
+- **baseline**: the restore baseline is captured with exactly the canonical
+  exclude list the upload applied — `prepareWorkspaceForSshExecution` returns
+  it as `transferExclude` and `prepareRemoteManagedRuntime` uses that
+  verbatim.
+- **restore**: `mergeDirectoryWithBaseline` only considers files present in
+  the baseline, so a file excluded from the upload is never treated as
+  deleted-at-restore time and survives restore untouched.
+
+This coherence is the contract: one selection, applied to upload, baseline,
+and restore alike. Excludes are a caller-provided policy — no default
+dependency/cache excludes are imposed, and patterns should target content
+that is provably regenerable or provably irrelevant to the mandate; do not
+exclude tracked files or `.git` (both are handled internally).
+
+Only pattern shapes that tar and the baseline matcher
+(`excludePatternMatches`) interpret with the same coverage are accepted,
+because tar excludes globs while the baseline matches literal rooted paths:
+
+- a **bare literal name** (`node_modules`) is expanded internally to the four
+  equivalent forms `node_modules`, `node_modules/*`, `*/node_modules`,
+  `*/node_modules/*` — tar matches bare names at any depth, and the expansion
+  reproduces exactly that in the baseline matcher;
+- **rooted literal paths** (`build/dist`) and the rooted-contents form
+  (`build/dist/*`) are applied together with their any-depth companions
+  (`*/build/dist`, `*/build/dist/*`): tar excludes are un-anchored by
+  default, so these shapes also match nested `pkg/build/dist/...`, and the
+  companion keeps the baseline matcher on the same coverage;
+- the **any-depth forms** `*/name` and `*/name/*` are applied as-is;
+- **any other pattern is dropped** (fail closed): glob patterns such as
+  `*.log` or `dist/*.map` are matched by tar but not by the baseline matcher,
+  so applying them would delete the matching local files at restore time.
+  Patterns containing a backslash are dropped for the same reason: GNU tar
+  reads a backslash as an escape (`a\b` matches `ab`, `dist\cache` matches
+  `distcache`), while the baseline matcher compares backslashes literally.
+  Dropping an exclude only transfers more files; it can never lose data.
+
+Passing `node_modules` alone is therefore sufficient (and equivalent to
+listing all four forms); the same holds for `build/dist` or `build/dist/*`
+alone — the companions are derived internally. Listing the expanded forms
+explicitly is also fine.
+
+## Per-run SSH workspace retention (dry-run, disabled by default)
+
+Each remote-managed run creates `<remoteCwd>/.paperclip-runtime/runs/<runId>`.
+Nothing in the round-trip removes those trees afterwards.
+[`src/ssh-run-retention.ts`](./src/ssh-run-retention.ts) is the first,
+deliberately minimal step towards native retention:
+
+- Policy is separate from the algorithm and is disabled by default; only
+  `mode: "dry-run"` is accepted (anything else fails closed). Proposed pilot
+  defaults: minimum age 48 h, at most 5 directories and 1 GiB per batch, a
+  30 s time budget, a 7-day quarantine before any final deletion, and runs
+  without an issue stay protected.
+- `evaluateSshRunWorkspaceRetention` turns structured eligibility evidence
+  (settled terminal run, settled finalization, resolved issue, unchanged
+  generations, no process references, provably recoverable git, no protected
+  adapter content, complete API data) into a `KEEP` / `SKIP` /
+  `QUARANTINE_ELIGIBLE` / `DELETE_ELIGIBLE` decision. Unverifiable evidence
+  produces `SKIP`; possibly-still-needed payloads produce `KEEP`.
+- `planSshRunWorkspaceRetentionBatch` bounds one batch and replays idempotent
+  receipts (`runId` + generation + policy revision) so concurrent finalizers
+  and crash replays do not duplicate decisions.
+- `sweepSshRunWorkspacesMetadataOnly` performs a read-only, metadata-only
+  scan (`find` + bounded `du`) and returns a manifest. It never writes,
+  renames, quarantines, or deletes anything. The policy time budget is
+  enforced with real clock readings (`now()` before planning and between
+  eligibility calls): SSH command timeouts are clamped to the remaining
+  budget, and candidates are deferred with `time_budget` instead of decided
+  once it is spent. An adapter-lane sweep has no Paperclip API access, so
+  its manifest reports every candidate as `SKIP api_incomplete` by design;
+  producing actionable decisions requires a server-side evidence provider,
+  and executing them requires a future, separately authorized
+  implementation with a shared native claim and proven quarantine/restore.
+- `prepareRemoteManagedRuntime` accepts an optional `runRetention` policy and
+  runs the sweep after the run's `restoreWorkspace()` completes — the real
+  finalization event of the SSH lane — excluding the current run. The sweep
+  is best-effort: it can never fail the run it closes.

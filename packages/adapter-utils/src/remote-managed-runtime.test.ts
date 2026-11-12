@@ -7,13 +7,27 @@ const {
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
+  sweepSshRunWorkspacesMetadataOnly,
   syncDirectoryToSsh,
 } = vi.hoisted(() => ({
-  prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
+  prepareWorkspaceForSshExecution: vi.fn(
+    async (_input?: unknown): Promise<{ gitBacked: boolean; transferExclude?: string[] }> => ({ gitBacked: false }),
+  ),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
   runSshCommand: vi.fn(async () => ({
     stdout: Buffer.from('{"token":"remote"}\n').toString("base64"),
     stderr: "",
+  })),
+  sweepSshRunWorkspacesMetadataOnly: vi.fn(async () => ({
+    mode: "dry-run",
+    policyRevision: "1",
+    runsRoot: "/app/.paperclip-runtime/runs",
+    scannedAtMs: 0,
+    scanned: 0,
+    plannedBytes: 0,
+    decisions: [],
+    deferred: [],
+    notes: [],
   })),
   syncDirectoryToSsh: vi.fn(async (_input: { localDir: string }) => undefined),
 }));
@@ -23,6 +37,10 @@ vi.mock("./ssh.js", () => ({
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryToSsh,
+}));
+
+vi.mock("./ssh-run-retention.js", () => ({
+  sweepSshRunWorkspacesMetadataOnly,
 }));
 
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
@@ -38,6 +56,9 @@ describe("remote managed runtime", () => {
     await mkdir(path.join(root, "node_modules"));
     await writeFile(path.join(root, ".gitignore"), "node_modules/\n");
     await writeFile(path.join(root, "node_modules", "personal.bin"), Buffer.from([0, 255, 1]));
+    // The upload reports the effective transfer excludes it applied; the
+    // baseline must mirror exactly that list (single source of truth).
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked: false, transferExclude: ["explicitly-excluded"] });
     const prepared = await prepareRemoteManagedRuntime({
       spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
         privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
@@ -56,6 +77,100 @@ describe("remote managed runtime", () => {
     }));
     const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { entries: Map<string, unknown> } }];
     expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(true);
+  });
+
+  it("mirrors the upload's effective transfer excludes into the baseline on the Git path too", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-git-"));
+    cleanupDirs.push(root);
+    await mkdir(path.join(root, "node_modules"), { recursive: true });
+    await writeFile(path.join(root, "node_modules", "left.bin"), Buffer.from([1, 2, 3]));
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({
+      gitBacked: true,
+      transferExclude: ["node_modules", "node_modules/*", "*/node_modules", "*/node_modules/*"],
+    });
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "git-backed", adapterKey: "test", workspaceLocalDir: root,
+      workspaceExclude: ["node_modules", "node_modules/*", "*/node_modules", "*/node_modules/*"],
+    });
+    await prepared.restoreWorkspace();
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
+      restoreGitHistory: true,
+      baselineSnapshot: expect.objectContaining({
+        exclude: [
+          ".git",
+          ".git/*",
+          ".paperclip-runtime",
+          "node_modules",
+          "node_modules/*",
+          "*/node_modules",
+          "*/node_modules/*",
+        ],
+        entries: expect.any(Map),
+      }),
+    }));
+    const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { entries: Map<string, unknown> } }];
+    // Excluded from the upload => excluded from the baseline => never a
+    // restore-time deletion candidate.
+    expect(args[0].baselineSnapshot.entries.has("node_modules/left.bin")).toBe(false);
+  });
+
+  it("runs the retention sweep after restore only when the policy is enabled, and never fails the run", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-retention-"));
+    cleanupDirs.push(root);
+    await mkdir(root, { recursive: true });
+
+    const enabledPolicy = {
+      enabled: true,
+      mode: "dry-run" as const,
+      minAgeHours: 48,
+      maxBatchDirs: 5,
+      maxBatchBytes: 1024 * 1024 * 1024,
+      timeBudgetMs: 30_000,
+      minQuarantineDays: 7,
+      runsWithoutIssue: "protected" as const,
+      policyRevision: "1",
+    };
+
+    // Disabled by default: no sweep at all.
+    const inert = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "retention-off", adapterKey: "test", workspaceLocalDir: root,
+      runRetention: {
+        policy: { ...enabledPolicy, enabled: false },
+      },
+    });
+    await inert.restoreWorkspace();
+    expect(sweepSshRunWorkspacesMetadataOnly).not.toHaveBeenCalled();
+
+    // Enabled: the sweep runs after the workspace restore, anchored to the
+    // same runs root, with the current run excluded.
+    let capturedManifest: unknown = null;
+    const active = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "retention-on", adapterKey: "test", workspaceLocalDir: root,
+      runRetention: {
+        policy: enabledPolicy,
+        onManifest: (manifest) => {
+          capturedManifest = manifest;
+        },
+      },
+    });
+    sweepSshRunWorkspacesMetadataOnly.mockRejectedValueOnce(new Error("sweep exploded"));
+    await active.restoreWorkspace();
+    expect(sweepSshRunWorkspacesMetadataOnly).toHaveBeenCalledWith(expect.objectContaining({
+      runsRoot: "/app/.paperclip-runtime/runs",
+      excludeRunIds: ["retention-on"],
+    }));
+    // A failing sweep is swallowed: restore already completed and no error
+    // escapes the finalization path. The second (successful) sweep proves the
+    // manifest callback is honored.
+    await active.restoreWorkspace();
+    expect(sweepSshRunWorkspacesMetadataOnly).toHaveBeenCalledTimes(2);
+    expect(capturedManifest).toEqual(expect.objectContaining({ mode: "dry-run" }));
   });
 
 

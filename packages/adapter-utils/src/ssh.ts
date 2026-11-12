@@ -1640,6 +1640,96 @@ export async function syncDirectoryFromSsh(input: {
   }
 }
 
+/**
+ * Normalizes caller-provided workspace exclude patterns into the effective
+ * transfer exclude list. One canonical list feeds every engine that must
+ * agree: the upload tar overlay (`--exclude`), the baseline snapshot walk
+ * (`excludePatternMatches`), and the restore download tar. Only shapes whose
+ * tar match set is covered by `excludePatternMatches` are accepted:
+ *
+ * - a bare literal name `X` (no slash, no glob metacharacters) is expanded
+ *   to the four equivalent forms `X`, "X slash star", "star slash X", "star
+ *   slash X slash star": tar matches a bare name at any depth, and the
+ *   expansion reproduces exactly that in the baseline matcher;
+ * - rooted literal paths (`dist/cache`) and their trailing "slash star"
+ *   contents form (`dist/cache slash star`) are kept and paired with their
+ *   any-depth companion ("star slash dist/cache" and its contents form):
+ *   tar's `--exclude` is un-anchored by default (`--no-anchored
+ *   --wildcards --wildcards-match-slash`), so these shapes also match
+ *   nested `pkg/dist/cache/...`, and only the companion form reproduces
+ *   that coverage in the baseline matcher;
+ * - the any-depth forms (a leading "star slash" prefix) stay as-is: tar
+ *   applies its exclude patterns un-anchored here, and the matcher's
+ *   any-depth reading of the leading prefix covers that same match set;
+ * - anything else is dropped. Glob patterns such as `*.log` or a `dist`
+ *   contents glob are interpreted by tar but not by the baseline matcher, so
+ *   such an exclude would leave the file in the baseline while the upload
+ *   omitted it — and the restore merge would then delete the local file.
+ *   Patterns containing a backslash are dropped for the same reason: GNU tar
+ *   reads a backslash as an escape (an `a\b` pattern matches `ab`, and
+ *   `dist\cache` matches `distcache`), while the baseline matcher compares
+ *   backslashes literally, so the two engines can never agree on such a
+ *   pattern. Dropping an exclude only transfers more files; it can never
+ *   lose data.
+ *
+ * Absolute paths, parent-relative escapes (a `..` segment), and empty
+ * segments are likewise dropped: excludes are workspace-relative by
+ * contract.
+ */
+export function workspaceExcludePatternForms(pattern: string): string[] | null {
+  const trimmed = pattern.trim();
+  if (trimmed.length === 0 || trimmed.startsWith("/")) return null;
+  // GNU tar reads a backslash in an exclude pattern as an escape (`a\b`
+  // matches `ab`, `dist\cache` matches `distcache`), while the baseline
+  // matcher compares backslashes literally: the engines cannot agree, so
+  // drop such patterns fail-closed (dropping only transfers more files).
+  if (trimmed.includes("\\")) return null;
+  let core = trimmed;
+  let anyDepth = false;
+  if (core.startsWith("*/")) {
+    anyDepth = true;
+    core = core.slice(2);
+  }
+  let contentsOnly = false;
+  if (core.endsWith("/*")) {
+    contentsOnly = true;
+    core = core.slice(0, -2);
+  }
+  if (core.length === 0 || /[*?[\]]/.test(core)) return null;
+  const segments = core.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) return null;
+  // A bare literal name needs the four-form expansion: tar matches bare
+  // names at any depth, while the unexpanded matcher form is root-anchored.
+  if (!anyDepth && !contentsOnly && segments.length === 1) {
+    return [core, `${core}/*`, `*/${core}`, `*/${core}/*`];
+  }
+  // Rooted multi-segment literals and rooted contents forms need the
+  // any-depth companion as well: tar applies --exclude un-anchored, so
+  // `dist/cache` or `node_modules/*` also excludes nested
+  // `pkg/dist/cache/...`, and the matcher only reaches that depth through
+  // the companion form.
+  if (!anyDepth) {
+    return [trimmed, `*/${trimmed}`];
+  }
+  return [trimmed];
+}
+
+function sanitizeWorkspaceExcludePatterns(patterns: string[] | undefined): string[] {
+  if (!patterns) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const pattern of patterns) {
+    const forms = workspaceExcludePatternForms(pattern);
+    if (!forms) continue;
+    for (const form of forms) {
+      if (seen.has(form)) continue;
+      seen.add(form);
+      result.push(form);
+    }
+  }
+  return result;
+}
+
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -1647,11 +1737,25 @@ export async function prepareWorkspaceForSshExecution(input: {
   onProgress?: RuntimeProgressSink;
   workspaceFileMode?: "all";
   workspaceExclude?: string[];
-}): Promise<{ gitBacked: boolean; repositories?: string[]; excludedPaths?: string[] }> {
+}): Promise<{
+  gitBacked: boolean;
+  repositories?: string[];
+  excludedPaths?: string[];
+  /**
+   * The sanitized workspace-level exclude patterns the upload actually
+   * applied, on both the Git and non-Git paths. Callers that snapshot a
+   * baseline for restore MUST use this list verbatim so a file excluded
+   * from the upload is also excluded from the baseline — and therefore
+   * never treated as deleted-at-restore time.
+   */
+  transferExclude?: string[];
+}> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
   const excludedPaths = await listProjectRepositoryStagingPaths(input.localDir);
   const excludedResult = excludedPaths.length > 0 ? { excludedPaths } : {};
+  const workspaceExclude = sanitizeWorkspaceExcludePatterns(input.workspaceExclude);
+  const transferExcludeResult = workspaceExclude.length > 0 ? { transferExclude: workspaceExclude } : {};
 
   if (gitSnapshot) {
     const repositories = await listLocalProjectRepositories(input.localDir);
@@ -1660,7 +1764,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       localDir: input.localDir,
       remoteDir,
       snapshot: gitSnapshot,
-      exclude: repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : excludedPaths,
+      exclude: [...(repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : excludedPaths), ...workspaceExclude],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1680,7 +1784,12 @@ export async function prepareWorkspaceForSshExecution(input: {
         progressLabel: relative,
       });
     }
-    return { gitBacked: true, ...(repositories.length > 0 ? { repositories } : {}), ...excludedResult };
+    return {
+      gitBacked: true,
+      ...(repositories.length > 0 ? { repositories } : {}),
+      ...excludedResult,
+      ...transferExcludeResult,
+    };
   }
 
   await clearRemoteDirectory({
@@ -1692,11 +1801,11 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime", ...excludedPaths, ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+    exclude: [".paperclip-runtime", ...excludedPaths, ...workspaceExclude],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
-  return { gitBacked: false, ...excludedResult };
+  return { gitBacked: false, ...excludedResult, ...transferExcludeResult };
 }
 
 export async function restoreWorkspaceFromSshExecution(input: {
