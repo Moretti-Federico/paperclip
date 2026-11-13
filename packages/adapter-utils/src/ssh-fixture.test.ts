@@ -861,6 +861,9 @@ describe("ssh env-lab fixture", () => {
     await preparedA.cleanupRemoteWorkspace?.();
     await runSshCommand(config, `test ! -e ${JSON.stringify(path.posix.dirname(preparedA.workspaceRemoteDir))}`);
     await runSshCommand(config, `test -d ${JSON.stringify(path.posix.dirname(preparedB.workspaceRemoteDir))}`);
+    // Idempotency: a repeated cleanup of an already-removed run directory
+    // must resolve without error so a retried teardown cannot fail a run.
+    await preparedA.cleanupRemoteWorkspace?.();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("round-trips project repositories nested in .paperclip-repositories across consecutive SSH runs", async () => {
