@@ -38,6 +38,27 @@ describe("ordinary task interruption", () => {
     expect(container.querySelector("a, details, input, textarea")).toBeNull();
     expect(container.textContent).not.toMatch(/service attention|process|receipt|workspace/i);
   });
+  it("names a resolved no-replay hold that no interruption projection carries", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={null} canRetry onRetry={retry}
+      blocker={{ recoveryActionId: "action", runId: "source", agentId: "agent",
+        cause: "legacy_execution_requires_reconciliation",
+        nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+        canRetry: true }} />));
+    const notice = container.querySelector('[data-testid="task-execution-retained-hold"]');
+    expect(notice?.textContent).toContain("Automatic recovery stopped.");
+    expect(notice?.textContent).toContain("Send a new message to continue from saved work");
+    const button = container.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]');
+    expect(button?.textContent).toBe("Retry");
+    await act(async () => button!.click());
+    expect(retry).toHaveBeenCalledOnce();
+    expect(container.querySelector("details, input, textarea")).toBeNull();
+  });
+  it("does not show a retained-hold notice without an effective reconciliation hold", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={null} canRetry onRetry={retry}
+      blocker={{ recoveryActionId: null, runId: null, agentId: null, cause: "conversation_ownership_unavailable",
+        nextAction: "Inspect the current execution." }} />));
+    expect(container.textContent).toBe("");
+  });
   it("keeps the failure visible and names the gate while a saved Retry waits on the budget", async () => {
     await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "budget", canRetry: false });
     const notice = container.querySelector('[data-testid="task-execution-waiting"]');

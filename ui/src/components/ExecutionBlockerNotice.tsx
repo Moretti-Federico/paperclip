@@ -1,5 +1,5 @@
 import { describeError } from "../api/errors";
-import type { IssueRelationIssueSummary, TaskInterruptionPresentation } from "@paperclipai/shared";
+import { requiresExecutionReconciliation, type ExecutionBlocker, type IssueRelationIssueSummary, type TaskInterruptionPresentation } from "@paperclipai/shared";
 import { AlertCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
@@ -36,8 +36,10 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  /** The effective admission hold. A resolved no-replay hold has no interruption projection. */
+  blocker?: ExecutionBlocker | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
   canRetry: boolean;
@@ -115,6 +117,19 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
         className="flex items-center gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
         <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
         <span className="min-w-0 flex-1">{budgetWaitText(presentation)}</span>
+      </div>
+    </div>
+  );
+  // A resolved no-replay hold still gates admission but has no active recovery
+  // action, so no interruption projection carries it. Name the supported path
+  // instead of leaving deferred wakes unexplained.
+  if (!optimistic && !presentation && blocker && requiresExecutionReconciliation(blocker.cause)) return (
+    <div className={cn("pt-4", className)}>
+      <div role="status" aria-label="Task status" data-testid="task-execution-retained-hold"
+        className="flex items-center justify-between gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
+        <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+        <span className="min-w-0 flex-1">{blocker.nextAction} Send a new message to continue from saved work; unverified actions are not repeated.</span>
+        {canRetry && blocker.canRetry && blocker.runId && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>
   );
