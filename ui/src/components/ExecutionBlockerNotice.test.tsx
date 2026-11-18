@@ -53,6 +53,28 @@ describe("ordinary task interruption", () => {
     expect(retry).toHaveBeenCalledOnce();
     expect(container.querySelector("details, input, textarea")).toBeNull();
   });
+  it("names a resolved no-replay hold that the run projection reports as a generic failure", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} canRetry onRetry={retry}
+      blocker={{ recoveryActionId: "action", runId: "source", agentId: "agent",
+        cause: "legacy_execution_requires_reconciliation",
+        nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated. Inspect the run before sending a new message to request continuation.",
+        canRetry: false }} />));
+    const notice = container.querySelector('[data-testid="task-execution-retained-hold"]');
+    expect(notice?.textContent).toContain("Inspect the run before sending a new message to request continuation.");
+    expect(notice?.textContent).not.toContain("Send a new message to continue from saved work");
+    expect(container.textContent).not.toContain("Couldn’t finish this attempt");
+    expect(container.querySelector("button")).toBeNull();
+  });
+  it("leaves a hold owned by an active recovery action to its own surface", async () => {
+    await act(async () => root.render(<ExecutionBlockerNotice presentation={failed} canRetry onRetry={retry}
+      activeRecoveryActionId="active"
+      blocker={{ recoveryActionId: "action", runId: "source", agentId: "agent",
+        cause: "legacy_execution_requires_reconciliation",
+        nextAction: "Automatic recovery stopped.", canRetry: true }} />));
+    expect(container.querySelector('[data-testid="task-execution-retained-hold"]')).toBeNull();
+    expect(container.textContent).toContain("Couldn’t finish this attempt. Your message is saved.");
+    expect(container.querySelector('[data-testid="task-execution-retry"]')?.textContent).toBe("Retry");
+  });
   it("does not show a retained-hold notice without an effective reconciliation hold", async () => {
     await act(async () => root.render(<ExecutionBlockerNotice presentation={null} canRetry onRetry={retry}
       blocker={{ recoveryActionId: null, runId: null, agentId: null, cause: "conversation_ownership_unavailable",

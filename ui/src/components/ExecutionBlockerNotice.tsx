@@ -36,10 +36,12 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, blocker, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, blocker, activeRecoveryActionId, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
   presentation: TaskInterruptionPresentation | null | undefined;
-  /** The effective admission hold. A resolved no-replay hold has no interruption projection. */
+  /** The effective admission hold. A resolved no-replay hold has no interruption projection of its own. */
   blocker?: ExecutionBlocker | null;
+  /** A hold owned by an active recovery action is already named by its own surface. */
+  activeRecoveryActionId?: string | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
   canRetry: boolean;
@@ -121,14 +123,17 @@ export function ExecutionBlockerNotice({ presentation, blocker, canRetry, onRetr
     </div>
   );
   // A resolved no-replay hold still gates admission but has no active recovery
-  // action, so no interruption projection carries it. Name the supported path
-  // instead of leaving deferred wakes unexplained.
-  if (!optimistic && !presentation && blocker && requiresExecutionReconciliation(blocker.cause)) return (
+  // action, so no interruption projection carries it. The run-based projection
+  // may still report a generic "failed" attempt, so name the supported path
+  // here instead of leaving deferred wakes unexplained.
+  const retainedHold = !optimistic && !activeRecoveryActionId && blocker?.recoveryActionId
+    && requiresExecutionReconciliation(blocker.cause) && (!presentation || presentation.state === "failed");
+  if (retainedHold && blocker) return (
     <div className={cn("pt-4", className)}>
       <div role="status" aria-label="Task status" data-testid="task-execution-retained-hold"
         className="flex items-center justify-between gap-3 rounded-lg bg-destructive/10 p-4 text-sm text-foreground">
         <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
-        <span className="min-w-0 flex-1">{blocker.nextAction} Send a new message to continue from saved work; unverified actions are not repeated.</span>
+        <span className="min-w-0 flex-1">{blocker.nextAction}{blocker.canRetry && " Send a new message to continue from saved work; unverified actions are not repeated."}</span>
         {canRetry && blocker.canRetry && blocker.runId && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>

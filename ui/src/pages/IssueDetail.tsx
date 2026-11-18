@@ -8320,7 +8320,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               action={issue.activeRecoveryAction ?? null} />
           )}
           {resolvedDetailTab === "chat" && (
-            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blocker={issue.executionBlocker} blockers={issue.blockedBy}
+            <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blocker={issue.executionBlocker} activeRecoveryActionId={issue.activeRecoveryAction?.id} blockers={issue.blockedBy}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
                 && isRetainedWorkspaceExportCause(issue.executionBlocker.cause) && retainedRecoveryOwnsRetry)} onRetry={taskRetry.retry}
