@@ -1888,12 +1888,11 @@ describe("VPS-787 portable anchor process isolation", () => {
     const previousCwd = process.cwd();
     let hookFired = false;
     const statSync = fss.statSync;
+    const writers: number[] = [];
     const releaseBarrier = (index: number) => {
-      // O_NONBLOCK: the handshake with a blocked reader completes
-      // immediately, and an already-consumed barrier fails with ENXIO
-      // instead of blocking the main thread forever.
-      const writer = fss.openSync(fifos[index]!, fss.constants.O_WRONLY | fss.constants.O_NONBLOCK);
-      fss.closeSync(writer);
+      // Keep a writer open even when this reader is still queued behind
+      // unrelated pool work. O_RDWR never waits for a reader or fails ENXIO.
+      writers[index] ??= fss.openSync(fifos[index]!, fss.constants.O_RDWR);
     };
     try {
       process.chdir(caller);
@@ -1915,25 +1914,22 @@ describe("VPS-787 portable anchor process isolation", () => {
       } finally {
         (fss as unknown as { statSync: typeof statSync }).statSync = statSync;
       }
-      if (!hookFired) releaseBarrier(0);
+      // A barrier open may itself still be queued ahead of pendingUnlink
+      // when unrelated work already occupied a thread. Release them all first.
+      for (let index = 0; index < fifos.length; index += 1) releaseBarrier(index);
       await pendingUnlink;
-      // Free every remaining barrier before awaiting their opens, or the
-      // blocked readers keep their workers forever.
-      for (let index = 1; index < fifos.length; index += 1) {
-        try { releaseBarrier(index); } catch {}
-      }
-      for (const open of opens) await open.then((handle) => handle.close(), () => undefined);
       // The caller's relative unlink removed the caller file only; the
       // scratch file was merely lstat through the isolated anchor.
       expect(fss.existsSync(path.join(caller, "victim"))).toBe(false);
       expect(fss.existsSync(path.join(scratch, "victim"))).toBe(true);
     } finally {
       process.chdir(previousCwd);
-      await ops.closeDir(fd).catch(() => undefined);
       for (let index = 0; index < fifos.length; index += 1) {
         try { releaseBarrier(index); } catch {}
       }
       await Promise.allSettled(opens.map((open) => open.then((handle) => handle.close(), () => undefined)));
+      for (const writer of writers) fss.closeSync(writer);
+      await ops.closeDir(fd).catch(() => undefined);
     }
   });
 });
