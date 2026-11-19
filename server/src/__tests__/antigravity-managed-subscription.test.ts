@@ -123,7 +123,8 @@ describe("managed Antigravity subscription projection and writeback", () => {
     await expect(access(join(provider, "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
     await writeFile(token, credential("resolved-project"));
     await runtime.cleanup();
-    expect(account.locks).toEqual(["grant:update", "secret:update"]);
+    // Preparation reads the secret version under a share lock before and after resolving it.
+    expect(account.locks).toEqual(["secret:share", "secret:share", "grant:update", "secret:update"]);
     expect(account.rotation).toHaveBeenCalledWith(account.refs[0].secretId,
       { value: credential("resolved-project"), preserveAiSessionEpoch: true }, { userId: "alice" });
     await expect(access(runtime.home!)).rejects.toMatchObject({ code: "ENOENT" });
@@ -162,14 +163,21 @@ describe("managed Antigravity subscription projection and writeback", () => {
     const runtime = await prepare(), token = join(String(runtime.config.env.GEMINI_HOME), "antigravity-acp", "acp_token.json");
     await writeFile(token, credential("resolved-project"));
     account.rotation.mockRejectedValueOnce(new Error("fixture database unavailable"));
+    // The managed home removal goes through the anchored run-scratch walker:
+    // its rmdir of the home root — plain path or fd-anchored form — is the
+    // partial-removal seam. Deleting the token and failing that one rmdir
+    // reproduces the same interrupted teardown the fs.rm seam used to.
     const realRm = fs.rm.bind(fs);
+    const realRmdir = fs.rmdir.bind(fs);
+    const homeName = `/${join(".", runtime.home!).split("/").pop()}`;
     let unavailable = true;
-    const remove = vi.spyOn(fs, "rm").mockImplementation(async (...args: Parameters<typeof fs.rm>) => {
-      if (unavailable && args[0] === runtime.home) {
+    const remove = vi.spyOn(fs, "rmdir").mockImplementation(async (...args: Parameters<typeof fs.rmdir>) => {
+      const target = String(args[0]);
+      if (unavailable && (target === runtime.home || target.endsWith(homeName))) {
         await realRm(token, { force: true });
         throw new Error("fixture partial removal");
       }
-      return realRm(...args);
+      return realRmdir(...args);
     });
     try {
       await expect(runtime.cleanup()).rejects.toThrow("fixture partial removal");
@@ -216,7 +224,7 @@ describe("managed Antigravity subscription projection and writeback", () => {
     } else {
       await expect(runtime.cleanup()).rejects.toThrow("The refreshed Google account does not match the selected connection.");
       expect(account.rotation).not.toHaveBeenCalled();
-      expect(account.locks).toEqual([]);
+      expect(account.locks).toEqual(["secret:share", "secret:share"]);
       expect(account.journal).toMatchObject({ provider: "google", google: { verified: false }, value: credential("resolved-project", "fixture-rotated-refresh") });
       expect(await readFile(token, "utf8")).toBe(credential("resolved-project", "fixture-rotated-refresh"));
     }

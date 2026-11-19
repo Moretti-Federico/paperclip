@@ -115,6 +115,39 @@ export default plugin;
 runWorker(plugin, import.meta.url);
 ```
 
+### Connectors
+
+Prefer a connector over top-level `tools` for new plugins. Declare it in the
+manifest `apps` (requires `connectors.provide`) with a method that uses
+`transport: "plugin"`, then serve its tools from the worker:
+
+```ts
+// manifest: apps: [{ slug: "records", ..., methods: [{ key: "default", transport: "plugin",
+//   auth: "none", settingsSchema: {...}, tools: { kind: "static", list: [
+//   { name: "lookup_record", risk: "read", parametersSchema: {...} }] } }] }]
+ctx.connectors.register("records", "lookup_record", async (params, runCtx) => {
+  // runCtx.connection: { id, appSlug, methodKey, grantId, settings, credential? }
+  return { content: `Record for ${runCtx.connection.settings.region}` };
+});
+// For `tools: { kind: "dynamic" }`, list tools per connection:
+ctx.connectors.listTools("records", async (connection) => [
+  { name: "lookup_record", risk: "read", parametersSchema: { type: "object" } },
+]);
+```
+
+A connector behaves like a built-in one: enabling the plugin only adds it to
+the Connectors catalog, and agents get its tools only from a connection
+installed for them or for the whole company. The host validates settings
+against `settingsSchema`, resolves the connection's credential (`api_key`
+methods) for each call only, and passes the run context from the gateway
+session; tool arguments cannot change it. Every static tool needs a
+registered handler before `setup` returns, or the worker fails to start.
+
+Top-level `tools` with `ctx.tools.register` stay supported as legacy. The host
+offers them as one implicit connector named after the plugin: installations
+that existed before connectors keep them for every agent, and new
+installations get them through an install of that connector.
+
 **Note:** `runWorker(plugin, import.meta.url)` must be called so that when the host runs your worker (e.g. `node dist/worker.js`), the RPC host starts and the process stays alive. When the file is imported (e.g. for tests), the main-module check prevents the host from starting.
 
 ### Worker lifecycle and context
@@ -461,6 +494,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `environment.drivers.register` |
 | | `local.folders` |
 | **Agent** | `agent.tools.register` |
+| **Connectors** | `connectors.provide` |
 | | `agents.invoke` |
 | | `access.members.write` |
 | | `access.invites.write` |
@@ -595,13 +629,14 @@ headers?, body? }`.
 
 Workflow plugins can use `ctx.issues` for orchestration-grade issue operations without importing host server internals.
 
+A child issue always gets its own execution workspace, realized from the project base. It keeps the parent's project and workspace strategy, never the parent's checkout, branch or unmerged changes. `inheritExecutionWorkspaceFromIssueId` likewise copies only the source issue's project and workspace strategy.
+
 Expanded create/update fields include blockers, billing code, board or agent assignees, labels, namespaced plugin origins, request depth, and safe execution workspace fields:
 
 ```ts
 const child = await ctx.issues.create({
   companyId,
   parentId: missionIssueId,
-  inheritExecutionWorkspaceFromIssueId: missionIssueId,
   title: "Implement feature slice",
   status: "todo",
   assigneeAgentId: workerAgentId,
@@ -1565,3 +1600,26 @@ The return value is transient raw credential material with the Connector's
 existing permissions. This capability is for trusted execution infrastructure,
 not agent-facing tools or UI. Never expose or persist it. See
 [GitHub identity](../../../doc/execution-github-identity.md#project-authorization-for-background-repository-work).
+
+## Login on an existing computer
+
+A driver can use the existing login PTY hooks for a login on a saved agent's
+computer. Core sends `purpose: "login"`, a closed `loginCommandKey`, a stable
+`creationOperationId`, and an absolute `requestedExpiresAt` to lease acquisition.
+Release and destroy must retire only that login allocation and preserve the
+computer. Omitted purpose retains the existing execution behavior.
+
+Core supplies `expiresAt` to the PTY open and an `inputId` for each input write.
+Input, stop, and close retain the opening company context so provider callbacks
+can use company-scoped host services during cleanup.
+A provider that retries delivery must retain the input identity and bytes, and
+reject reuse of the identity with different input. A failed input call ends the
+Core login; Core does not silently replay an unconfirmed write.
+
+Providers can implement `onLoginPtyReadCredential` to export the fixed Codex
+credential artifact for a bound login lease. The result is
+`{ kind: "codex-auth-json", authJson }`; the request accepts no path or command.
+The worker advertises this optional method only when the hook exists. The host
+must check that method before using this read path, enforce a size limit, and
+keep credential bytes out of logs and public session responses. Existing sandbox
+providers can continue to use their descriptor-bound credential read.
