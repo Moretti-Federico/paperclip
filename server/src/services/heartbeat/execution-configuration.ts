@@ -74,6 +74,8 @@ export interface HeartbeatExecutionConfigurationInput {
   config: {
     sourceWorkspaceConfig: Record<string, unknown>;
     aiBinding: AiConnectionBinding | undefined;
+    /** Per-run scratch directory hosting the managed AI credential home. */
+    runScratchDir?: string | null;
   };
   policy: Pick<HeartbeatWorkspacePreparationInput["policy"],
     "trustPreset" | "useIsolatedTaskDirectory" | "requestedExecutionWorkspaceMode"> & { explicitTaskDirectory: boolean };
@@ -206,7 +208,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
     try {
-      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig }));
+      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, ...(input.config.runScratchDir ? { managedHomeParent: input.config.runScratchDir } : {}), config: resolvedConfig }));
       onManagedAiRuntimeAcquired(managedAiRuntime);
     } catch (error) {
       // Only fresh executions can receive a pre-provider wait receipt. A
