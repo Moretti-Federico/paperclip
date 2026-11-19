@@ -1904,6 +1904,8 @@ export function heartbeatService(
       return;
     }
 
+    // Scratch events must not change the closed event set of an undispatched preparation.
+    let scratchDispatchGateEntered = false;
     let legacyAdapterEntered = false;
     let legacyLocalAdapterEntered = false;
     let legacyPreparationFailedBeforeDispatch = false;
@@ -2995,6 +2997,7 @@ export function heartbeatService(
         try {
           return await dispatchResolvedInteractionContinuationAfterAdmission((markDispatchStarted) => {
             entered = true;
+            scratchDispatchGateEntered = true;
             return dispatch(markDispatchStarted);
           }, reservation);
         } catch (error) {
@@ -3968,7 +3971,7 @@ export function heartbeatService(
           // rejects any extra event before a retry can reuse the outcome), so
           // its scratch outcome is recorded logger-only.
           const runDispatchedProcess = legacyAdapterEntered || nativeDispatchStarted ||
-            nativeOwnershipHeld || dispatchGateEntered;
+            nativeOwnershipHeld || scratchDispatchGateEntered;
           const recordScratchOutcome = async (event: {
             eventType: string;
             stream: "system";
