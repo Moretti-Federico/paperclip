@@ -155,6 +155,10 @@ are not on this list. They hold attested provider pins, so change them by hand
 
 ## Trusted PR Workflow
 
+This fork uses revision-local PR workflows and the full local test matrix;
+see [fork CI](fork-ci.md) for audit evidence and bootstrap limitations. The
+canonical upstream setup described below applies to `paperclipai/paperclip`.
+
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
 The AWS runner group `paperclip-public-pr` must allow
 `paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master`.
