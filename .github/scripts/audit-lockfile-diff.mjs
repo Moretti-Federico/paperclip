@@ -41,7 +41,10 @@ function audit(lockfile, directory) {
   mkdirSync(directory, { recursive: true });
   writeFileSync(resolve(directory, 'package.json'), '{"private":true}\n');
   writeFileSync(resolve(directory, 'pnpm-lock.yaml'), lockfile);
-  const run = spawnSync('pnpm', ['audit', '--json'], { cwd: directory, encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024 });
+  // These retained reports live below the checkout. Do not let pnpm discover
+  // the ancestor workspace and audit its resolved lockfile instead of this
+  // immutable base/head copy.
+  const run = spawnSync('pnpm', ['--ignore-workspace', 'audit', '--json'], { cwd: directory, encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024 });
   writeFileSync(resolve(directory, 'audit.json'), run.stdout ?? '');
   writeFileSync(resolve(directory, 'audit.stderr'), run.stderr ?? '');
   assert.ok(!run.error && !run.signal && [0, 1].includes(run.status), `Audit execution failed: ${run.error?.message ?? run.status}`);
