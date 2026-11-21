@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -725,6 +725,86 @@ describe("ssh env-lab fixture", () => {
 
     expect(result.stdout).toContain("regular");
     expect(result.stdout).toContain("{\"token\":\"secret\"}");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("restores relative symlink targets verbatim across consecutive SSH sync-backs", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    // Kept outside started.workspaceDir: the remote source lives under the
+    // fixture workspace, and each restore clears every localDir entry that is
+    // not preserved, so the two directories must never overlap.
+    const localDir = path.join(rootDir, "workspace-restored");
+
+    // The Git-tracked skill links from VPS-824: two climbing to existing
+    // internal targets, one dangling (target missing on both sides), plus an
+    // absolute external link and a regular file. The sync-back used to rewrite
+    // each relative target to an absolute path under the deleted
+    // /tmp/paperclip-ssh-sync-back-* staging directory, leaving `git status`
+    // dirty and the links broken after every restore.
+    const skillLinks = [
+      { linkPath: ".claude/skills/company-creator", target: "../../.agents/skills/company-creator" },
+      { linkPath: ".claude/skills/directions-lab", target: "../../.agents/skills/directions-lab" },
+      { linkPath: ".claude/skills/pending-skill", target: "../../.agents/skills/pending-skill" },
+    ] as const;
+    const externalTargetPath = path.join(rootDir, "external-target.txt");
+    await writeFile(externalTargetPath, "external payload\n", "utf8");
+
+    await mkdir(path.join(localDir, ".agents/skills/company-creator"), { recursive: true });
+    await mkdir(path.join(localDir, ".agents/skills/directions-lab"), { recursive: true });
+    await mkdir(path.join(localDir, ".claude/skills"), { recursive: true });
+    await writeFile(path.join(localDir, ".agents/skills/company-creator/SKILL.md"), "company-creator\n", "utf8");
+    await writeFile(path.join(localDir, ".agents/skills/directions-lab/SKILL.md"), "directions-lab\n", "utf8");
+    await writeFile(path.join(localDir, "README.md"), "regular file\n", "utf8");
+    for (const entry of skillLinks) {
+      await symlink(entry.target, path.join(localDir, entry.linkPath));
+    }
+    await symlink(externalTargetPath, path.join(localDir, "external-link"));
+
+    await git(localDir, ["init"]);
+    await git(localDir, ["checkout", "-b", "main"]);
+    await git(localDir, ["config", "user.name", "Paperclip Test"]);
+    await git(localDir, ["config", "user.email", "test@paperclip.dev"]);
+    await git(localDir, ["add", "."]);
+    await git(localDir, ["commit", "-m", "symlink workspace"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH relative symlink sync-back test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const remoteDir = path.posix.join(started.workspaceDir, "symlink-sync-back-source");
+
+    await syncDirectoryToSsh({ spec, localDir, remoteDir, exclude: [".git", ".paperclip-runtime"] });
+
+    for (let round = 1; round <= 2; round += 1) {
+      await syncDirectoryFromSsh({
+        spec,
+        remoteDir,
+        localDir,
+        exclude: [".git", ".paperclip-runtime"],
+        preserveLocalEntries: [".git"],
+      });
+
+      for (const entry of skillLinks) {
+        const target = await readlink(path.join(localDir, entry.linkPath));
+        expect(target, `round ${round}: readlink ${entry.linkPath}`).toBe(entry.target);
+        expect(target, `round ${round}: staging leak in ${entry.linkPath}`).not.toContain("paperclip-ssh-sync-back");
+      }
+      await expect(
+        stat(path.join(localDir, ".claude/skills/pending-skill")),
+        `round ${round}: dangling link must stay dangling`,
+      ).rejects.toMatchObject({ code: "ENOENT" });
+
+      const externalTarget = await readlink(path.join(localDir, "external-link"));
+      expect(externalTarget, `round ${round}: external link target`).toBe(externalTargetPath);
+      expect(externalTarget, `round ${round}: staging leak in external-link`).not.toContain(
+        "paperclip-ssh-sync-back",
+      );
+      await expect(readFile(path.join(localDir, "external-link"), "utf8")).resolves.toBe("external payload\n");
+
+      await expect(readFile(path.join(localDir, "README.md"), "utf8")).resolves.toBe("regular file\n");
+
+      expect(await git(localDir, ["status", "--porcelain"]), `round ${round}: git status after restore`).toBe("");
+    }
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("clears stale files when plain SSH preparation is retried", async () => {
