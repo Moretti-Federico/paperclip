@@ -1,8 +1,6 @@
 name: Trusted PR CI
 
-# Rollout is intentionally two-step: merge this reusable workflow first, then
-# replace pr.yml with an immutable-SHA caller so the active CI definition cannot
-# drift from this file.
+# Called locally so the fork's CI contract follows its own source revision.
 on:
   workflow_call:
 
@@ -25,7 +23,7 @@ concurrency:
 
 jobs:
   gate:
-    uses: paperclipai/paperclip/.github/workflows/ci-routing.yml@master
+    uses: ./.github/workflows/ci-routing.yml
 
   test_selection:
     name: Select Vitest files
@@ -267,6 +265,25 @@ jobs:
       # fails fast when the merge tree cannot resolve at all.
       - name: Validate dependency resolution
         run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+
+      # Audit both checked-in lock graphs without dependency installation or
+      # lifecycle scripts. Retain inherited findings; fail on introduced ones
+      # or audit errors, matching Dependency Review's vulnerability-delta scope.
+      - name: Audit dependency vulnerability changes
+        id: dependency_audit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node .github/scripts/audit-lockfile-diff.mjs
+
+      - name: Retain dependency audit evidence
+        if: always() && steps.dependency_audit.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dependency-audit-${{ github.run_attempt }}
+          path: .dependency-audit/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload CI profile timings
         continue-on-error: true
@@ -825,7 +842,9 @@ jobs:
     needs: [gate]
     if: ${{ needs.gate.outputs.full_ci == 'true' && (needs.gate.outputs.plan == '' || fromJSON(needs.gate.outputs.plan).jobs.verify_paperclip_runner.run) }}
     runs-on: ${{ needs.gate.outputs.runner }}
-    timeout-minutes: 20
+    # Cold release preparation has its own 15-minute limit; retain the
+    # original 20-minute test allowance on the native-server lane.
+    timeout-minutes: ${{ matrix.command == 'test:typescript:vitest --native-server' && 35 || 20 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.gate.outputs.plan != '' && toJSON(fromJSON(needs.gate.outputs.plan).jobs.verify_paperclip_runner.matrix) || '{"include":[{"lane_label":"static checks","command":"check:static","task":"ci:runner-static"},{"lane_label":"rust","command":"check:runner","release_crate":true,"task":"ci:runner-rust"},{"lane_label":"vitest package (1/3)","command":"test:typescript:vitest --package-lane=1/3","task":"ci:runner-vitest"},{"lane_label":"vitest package (2/3)","command":"test:typescript:vitest --package-lane=2/3","task":"ci:runner-vitest"},{"lane_label":"vitest package (3/3)","command":"test:typescript:vitest --package-lane=3/3","task":"ci:runner-vitest"},{"lane_label":"vitest native server","command":"test:typescript:vitest --native-server","release_crate":true,"task":"ci:runner-vitest"}]}') }}
@@ -1038,6 +1057,15 @@ jobs:
           args: '[]'
           partition: ${{ strategy.job-index || 0 }}
           force: ${{ needs.gate.outputs.profile_ci == 'true' || needs.gate.outputs.plan == '' || fromJSON(needs.gate.outputs.plan).mode != 'enabled' || fromJSON(needs.gate.outputs.plan).forceReason != null }}
+
+      # Dot's beforeAll retains its bounded incremental build. Do the cold
+      # release build separately, after cache restore and before Vitest can
+      # start competing Cargo builds. A timeout here fails preparation.
+      - name: Prepare release daemon for native server tests
+        if: matrix.command == 'test:typescript:vitest --native-server'
+        timeout-minutes: 15
+        working-directory: packages/paperclip-runner
+        run: cargo build --release --locked --manifest-path runner/Cargo.toml -p paperclip-runner-core --bin paperclip-runnerd
 
       - name: Verify Paperclip Runner
         if: matrix.command != 'check:runner' || hashFiles('turbo.json') == ''
