@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -108,21 +108,32 @@ async function withOwnedChildren(root, action) {
   }
 }
 
+// Build our own native executable: host coreutils may share a multicall image
+// and select their behavior from argv[0], which changes when staged/renamed.
+// cc is part of both the Linux Rust CI toolchain and macOS developer tools.
+async function buildFixture(root, output, revision) {
+  const source = path.join(root, `fixture-${revision}.c`);
+  await writeFile(source, `#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\nint main(int argc, char **argv) {\n  if (argc > 1) sleep((unsigned)strtoul(argv[1], NULL, 10));\n  puts("fixture-${revision}");\n  return 0;\n}\n`);
+  execFileSync("cc", [source, "-o", output], { timeout: 30_000, stdio: "pipe" });
+}
+
 test("atomically publishes while the previous executable is running", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
   const destination = path.join(root, "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    await stageRunnerBinary("/bin/sleep", destination);
+    const fixture = path.join(root, "fixture");
+    await buildFixture(root, fixture, "atomic");
+    await stageRunnerBinary(fixture, destination);
     const previous = await stat(destination);
     const old = start(destination, ["30"]);
     await old.spawned;
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(fixture, destination);
     const published = await stat(destination);
     assert.notEqual(published.ino, previous.ino);
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
+    assert.deepEqual((await readdir(root)).sort(), ["fixture", "fixture-atomic.c", "paperclip-runnerd"]);
     const next = start(destination, ["0"]);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
@@ -137,21 +148,12 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
   const source = path.join(packageRoot, "runner", "crates", "runner-core", "src", "main.rs");
   const built = path.join(packageRoot, "runner", "target", "release", "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    const copyHostFixture = async (input, output) => {
-      await copyFile(input, output);
-      if (process.platform === "darwin") {
-        const slices = execFileSync("/usr/bin/lipo", ["-archs", input], { encoding: "utf8" }).trim().split(/\s+/);
-        const architecture = slices.find(value => process.arch === "arm64" ? value.startsWith("arm64") : value === "x86_64");
-        assert.ok(architecture);
-        if (slices.length > 1) execFileSync("/usr/bin/lipo", [input, "-thin", architecture, "-output", output]);
-      }
-    };
     await mkdir(path.dirname(source), { recursive: true });
     await writeFile(source, "fn main() {}\n");
     await mkdir(path.dirname(built), { recursive: true });
-    await copyHostFixture("/bin/echo", built);
+    await buildFixture(root, built, "rebuilt");
     const previousBuild = path.join(root, "previous-build");
-    await copyHostFixture("/bin/sleep", previousBuild);
+    await buildFixture(root, previousBuild, "previous");
     await stageRunnerBinary(previousBuild, hostTarget);
     await stageRunnerBinary(built, path.join(binaryRoot, "paperclip-runnerd"));
     const platforms = {}, releaseBytes = new Map();
