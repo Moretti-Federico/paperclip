@@ -22,10 +22,20 @@ registry response; this reports an unchanged graph, not a vulnerability-free
 project. There is no ignore list, severity waiver or success fallback.
 This is an independent vulnerability check, not a claim that GitHub Dependency
 Review ran. It does not supply Dependency Review's dependency-diff or license
-analysis. The existing `pull_request_target` review workflow remains unchanged
-and may still fail because Dependency Review is unsupported on this repository.
-It executes the base branch's definition, so a PR cannot repair that check in
-its own run. Keep that failure visible when assessing merge readiness.
+analysis. The existing `pull_request_target` review workflow
+(`commitperclip-review.yml`) remains unchanged. Its Dependency Review step
+passes on this repository since 2026-11-21; the job then fails at "Generate
+commitperclip token" because the `COMMITPERCLIP_KEY` secret is not configured
+in the fork. It executes the base branch's definition, so a PR cannot repair
+that check in its own run, and supplying the key or changing the workflow is a
+repository-owner decision. Keep that failure visible when assessing merge
+readiness.
+
+`native-log-archive.integration.test.ts` compares the 4 MiB archive read-back
+with `Buffer.equals` and a SHA-256 digest. Vitest's deep `toEqual` on a Buffer
+of that size spent over 20 s of CPU in element-by-element comparison, which
+was the cause of the recurring 15 s timeout in the server shard; the
+migration itself completes in well under a second.
 
 Runner staging tests compile small, host-native C fixtures using `cc` from
 the Linux C/Rust toolchain or macOS developer tools. They deliberately avoid

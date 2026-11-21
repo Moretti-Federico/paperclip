@@ -102,8 +102,14 @@ describeEmbeddedPostgres("online native historical log preservation", () => {
         prefix: `run-logs/segments-v1/${f.companyId}/${f.agentId}/${f.runId}.archive` });
       const head = (await archive.head())!.head;
       expect(head).toMatchObject({ closed: true, sourceCursor: 0 });
-      expect(Buffer.concat([await archive.readRange(head, 0, 4 * 1024 * 1024),
-        await archive.readRange(head, 4 * 1024 * 1024, 7)])).toEqual(bytes);
+      const restored = Buffer.concat([await archive.readRange(head, 0, 4 * 1024 * 1024),
+        await archive.readRange(head, 4 * 1024 * 1024, 7)]);
+      // Compare natively: Vitest's deep toEqual walks a 4 MiB Buffer element
+      // by element and spends 20+ s of CPU there, which made this test time
+      // out on CI. Buffer.equals is the same exact-byte check.
+      expect(restored.length).toBe(bytes.length);
+      expect(createHash("sha256").update(restored).digest("hex")).toBe(createHash("sha256").update(bytes).digest("hex"));
+      expect(restored.equals(bytes)).toBe(true);
     });
   });
 
