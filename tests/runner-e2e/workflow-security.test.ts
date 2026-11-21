@@ -3,8 +3,6 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-// PR #13470 uses the code-owner-reviewed default branch for this first-party workflow.
-const ordinaryPrTrustedWorkflowRevision = "master";
 const fullStackTestNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,\s*build_remote_provider_pack,?\s*\]/u;
 const buildRunnerNeeds =
@@ -62,24 +60,28 @@ describe("public repository paid workflow security", () => {
 
   });
 
-  it("uses the reviewed master branch for the first-party trusted PR workflow", async () => {
+  it("uses the same-revision local PR workflow with read-only permissions and no secrets", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
     );
-    const trustedWorkflowCalls = [
-      ...ordinaryPrWorkflow.matchAll(
-        /^\s+uses:\s+(paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml)@([^\s#]+)$/gmu,
-      ),
-    ];
+    // Match every reusable job call so an added upstream call also fails.
+    const trustedWorkflowCalls = [...ordinaryPrWorkflow.matchAll(
+      /^ {4}uses:\s*([^\s#]+)$/gmu,
+    )].map(match => match[1]);
 
-    expect(trustedWorkflowCalls).toHaveLength(1);
-    expect(trustedWorkflowCalls[0]?.[1]).toBe(
-      "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
+    expect(trustedWorkflowCalls).toEqual(["./.github/workflows/pr-trusted.yml"]);
+    expect(ordinaryPrWorkflow).toMatch(/^ {2}pull_request:$/mu);
+    expect(ordinaryPrWorkflow).not.toMatch(/^ {2}pull_request_target:/mu);
+
+    const trustedWorkflow = await readFile(
+      path.join(repositoryRoot, ".github/workflows/pr-trusted.yml"), "utf8",
     );
-    expect(trustedWorkflowCalls[0]?.[2]).toBe(
-      ordinaryPrTrustedWorkflowRevision,
-    );
+    for (const workflow of [ordinaryPrWorkflow, trustedWorkflow]) {
+      expect(workflow).toMatch(/^permissions:\n {2}actions: read\n {2}contents: read\n {2}pull-requests: read$/mu);
+      expect(workflow).not.toMatch(/^\s*[\w-]+:\s*write(?:-all)?\s*$/mu);
+      expect(workflow).not.toMatch(/^\s*secrets\s*:|\$\{\{[^}]*\bsecrets(?:\.|\[)/mu);
+    }
   });
 
   // PR #18348 added the ninth pr-trusted bootstrap, in the Vitest selection job.
