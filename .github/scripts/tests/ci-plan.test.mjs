@@ -262,7 +262,7 @@ else process.exit(3);
         ...process.env, PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
         RUNNER_TEMP: directory, FULL_CI: "true", PROFILE_CI: "false", FORCE_FULL_CI: "false",
         CI_INCREMENTAL_MODE: "enabled", STACK_JSON: "null", EVENT_BASE_SHA: "b".repeat(40), EVENT_HEAD_SHA: prHead, EVENT_MERGE_SHA: merge,
-        TEST_GIT_REPOSITORY: repository,
+        TEST_GIT_REPOSITORY: repository, EVENT_REPOSITORY: "paperclipai/paperclip",
         GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: "", ...overrides,
       } });
       assert.equal(result.status, 0, result.stderr);

@@ -270,12 +270,13 @@ jobs:
       # lifecycle scripts. Retain inherited findings; fail on introduced ones
       # or audit errors, matching Dependency Review's vulnerability-delta scope.
       - name: Audit dependency vulnerability changes
+        id: dependency_audit
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node .github/scripts/audit-lockfile-diff.mjs
 
       - name: Retain dependency audit evidence
-        if: always()
+        if: always() && steps.dependency_audit.outcome != 'skipped'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: dependency-audit-${{ github.run_attempt }}
