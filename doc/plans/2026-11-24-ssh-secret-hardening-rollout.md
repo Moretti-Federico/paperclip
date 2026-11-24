@@ -1,6 +1,7 @@
 # SSH secret hardening: rollout, verification, rollback (VPS fork)
 
-Status: ready for owner GO. Nothing here is deployed.
+Status: candidate image built 2026-11-24 13:12 UTC (`sha256:3ca9de40…e7543`,
+all static checks passed, production unchanged). Cutover awaits owner GO.
 
 ## Scope
 
@@ -51,13 +52,28 @@ construction is absent, and the chunk imports with its exports. It ends with
 
 ## 3. Cutover (needs explicit GO)
 
-1. Confirm that no agent run is active (an SSH copy phase must not be cut).
-2. Back up the compose files.
-3. Set `image:` to the candidate tag in every file that names the current
-   image: `/srv/paperclip/compose.yml`, `/srv/paperclip/compose.override.yml`,
-   `/srv/paperclip/upgrade-2026.1106.0/override.yml`.
-4. Run `docker compose config | grep image:` and confirm the candidate tag.
-5. Run `docker compose up -d paperclip`.
+```sh
+sudo bash scripts/vps-ssh-secret-hardening/owner-cutover.sh --rotate-agent-jwt
+```
+
+The script:
+
+1. Checks the candidate id (`sha256:3ca9de40…`) and the running image.
+2. Checks that each of the three compose files names the old tag exactly once.
+3. Stops if an agent run is `running`.
+4. Backs up every file it changes (`*.before-ssh-secret-hardening-<UTC>.bak`).
+5. Switches `image:` in `compose.yml`, `compose.override.yml` and
+   `upgrade-2026.1106.0/override.yml`.
+6. Confirms that `docker compose config --images` resolves to the candidate.
+7. Runs `docker compose up -d paperclip`.
+
+It then waits for `/api/health` and checks the image id and the chunk hash in
+the container. If any of these checks fails, it restores the backups and
+restarts on the old image automatically.
+
+`--rotate-agent-jwt` appends a generated `PAPERCLIP_AGENT_JWT_SECRET` to `.env`
+(never printed). This invalidates every agent JWT minted before the cutover.
+Omit the flag to let those tokens expire (48 h).
 
 ## 4. Post-install verification
 
@@ -76,14 +92,15 @@ construction is absent, and the chunk imports with its exports. It ends with
 
 ## 5. Rollback
 
-The fix changes no data. Rollback is the previous image:
+The fix changes no data. Roll back with the suffix that the cutover printed:
 
-1. Restore the backed-up compose files (or set `image:` back to
-   `local/paperclip:2026.1106.0-oauth-v3-ssh-cleanup-candidate`).
-2. `docker compose up -d paperclip`.
-3. Check `/api/health` and the image id `sha256:608f0708…`.
-4. Optional: `sudo rmdir /home/paperclip-dev/.paperclip-run-env`.
+```sh
+sudo bash scripts/vps-ssh-secret-hardening/owner-rollback.sh before-ssh-secret-hardening-<UTC>
+```
 
+The script restores the compose files, and `.env` if the cutover rotated the
+JWT secret. It restarts the container, then checks health and the image id
+`sha256:608f0708…`. Optional: `sudo rmdir /home/paperclip-dev/.paperclip-run-env`.
 A rollback restores the argv exposure.
 
 ## 6. Credential follow-up (owner decision)
