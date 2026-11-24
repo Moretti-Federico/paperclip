@@ -23,7 +23,7 @@ cd "$ROOT"
 docker compose config --images | sort -u
 docker compose up -d paperclip
 deadline=$((SECONDS + ${HEALTH_TIMEOUT_SEC:-240}))
-until curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; do
+until curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; do
   (( SECONDS < deadline )) || { echo "ROLLBACK=NOT HEALTHY: docker compose logs --tail 100 paperclip"; exit 1; }
   sleep 3
 done

@@ -38,7 +38,8 @@ esac
 wait_healthy() {
   local deadline=$((SECONDS + ${HEALTH_TIMEOUT_SEC:-240}))
   while (( SECONDS < deadline )); do
-    if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then return 0; fi
+    # HTTP 200 alone is not enough: the server answers "starting" first.
+    if curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; then return 0; fi
     sleep 3
   done
   return 1
