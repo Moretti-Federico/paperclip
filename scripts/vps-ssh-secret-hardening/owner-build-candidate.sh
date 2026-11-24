@@ -25,7 +25,7 @@ echo "=== BUILD CANDIDATE ==="
 cat > "$STAGE/Dockerfile" <<DOCKER
 FROM $BASE
 COPY --chown=node:node chunk-3ZK6CBQV.mjs $CHUNK
-LABEL local.paperclip.ssh-secret-hardening="vps/ssh-secret-hardening" \\
+LABEL local.paperclip.ssh-secret-hardening="fix/ssh-secret-argv-hardening" \\
       local.paperclip.ssh-secret-hardening.chunk-sha256="$NEW_CHUNK_SHA"
 DOCKER
 export TMPDIR="$STAGE"
