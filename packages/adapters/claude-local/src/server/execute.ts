@@ -1,5 +1,6 @@
 import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-observability";
+import { cleanupRestoredRunWorkspace } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
@@ -680,6 +681,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  const cleanupRemoteWorkspace = preparedExecutionTargetRuntime?.cleanupRemoteWorkspace;
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))
     : null;
@@ -1293,6 +1295,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
+  let completedResult: AdapterExecutionResult | null = null;
+  let providerCollectionSucceeded = false;
   try {
     const minimumCliVersion = passesConfiguredModel && claudeCommandLooksLike(command, "claude")
       ? minimumClaudeCliVersionForModel(model)
@@ -1415,13 +1419,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
       const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      return (completedResult = toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true }));
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    return (completedResult = toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId }));
   } finally {
     try {
       await providerStop.collectBeforeRestore();
+      providerCollectionSucceeded = true;
     } finally {
       if (paperclipBridge) {
         await paperclipBridge.stop();
@@ -1433,6 +1438,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         await restoreRemoteWorkspace();
       }
+      await cleanupRestoredRunWorkspace({
+        cleanup: cleanupRemoteWorkspace,
+        result: completedResult,
+        providerStopped: providerStop.hasStopped(),
+        collectionSucceeded: providerCollectionSucceeded,
+        cancelled: Boolean(ctx.signal?.aborted),
+        onFailure: () => onLog("stderr", "[paperclip] SSH run workspace cleanup failed; retained for recovery.\n"),
+      });
     }
   }
 }
