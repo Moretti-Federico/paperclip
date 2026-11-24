@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -21,7 +21,18 @@ vi.mock("node:child_process", async (importOriginal) => {
 import { createSshCommandManagedRuntimeRunner } from "./ssh.js";
 
 const roots: string[] = [];
+let previousHome: string | undefined;
+// Env values are staged in "$HOME/.paperclip-run-env" on the (simulated)
+// remote, so keep that inside a throwaway directory.
+beforeEach(async () => {
+  previousHome = process.env.HOME;
+  const home = await mkdtemp(path.join(os.tmpdir(), "ssh-managed-home-"));
+  roots.push(home);
+  process.env.HOME = home;
+});
 afterEach(async () => {
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
