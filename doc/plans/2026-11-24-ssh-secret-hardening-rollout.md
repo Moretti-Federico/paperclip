@@ -1,7 +1,7 @@
 # SSH secret hardening: rollout, verification, rollback (VPS fork)
 
-Status: candidate image built 2026-11-24 13:12 UTC (`sha256:3ca9de40…e7543`,
-all static checks passed, production unchanged). Cutover awaits owner GO.
+Status: candidate built 2026-11-24 12:12 UTC and cut over 12:17 UTC (`sha256:3ca9de40…e7543`,
+all checks passed; agent JWT secret rotated at cutover).
 
 ## Scope
 
