@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -471,7 +471,10 @@ describe("ssh env-lab fixture", () => {
       },
       command: "node",
       args: ["--version"],
-      env: { FOO: "bar" },
+      // No env: a non-empty env would stage a private remote file first, which
+      // needs a reachable host (covered by ssh-secret-transport.test.ts and
+      // the fixture test below).
+      env: {},
     });
 
     // The remote script rides the last ssh argument. The SSH target is an
@@ -491,10 +494,11 @@ describe("ssh env-lab fixture", () => {
     // nvm in .bashrc still resolves node under a non-login SSH command.
     expect(remoteScript).toContain(".bashrc");
     // The last ssh argument wraps the script as `sh -c '...'`, so the inner
-    // quotes are escaped. Assert the command still runs: cd, env, and the argv.
+    // quotes are escaped. Assert the command still runs: cd and the argv.
     expect(remoteScript).toContain("cd ");
     expect(remoteScript).toContain("/srv/paperclip/workspace");
-    expect(remoteScript).toContain("exec env ");
+    // Environment values never ride the ssh argv.
+    expect(remoteScript).not.toContain("exec env ");
     expect(remoteScript).toContain("node");
     expect(remoteScript).toContain("--version");
     await target.cleanup();
@@ -521,6 +525,67 @@ describe("ssh env-lab fixture", () => {
       }),
     ).rejects.toThrow("Invalid SSH environment variable key: BAD KEY");
   });
+
+  it("keeps injected environment values out of every process argv during a real SSH run", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH secret argv fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    // Synthetic credential, unique per run.
+    const sentinel = `SYNTH-SSH-SECRET-${process.pid}-${Date.now()}`;
+    const value = `${sentinel} 'quoted' "double" $(echo nope) \n second line\n`;
+    const outputPath = path.join(rootDir, "printed-env.txt");
+    const envDir = path.join(os.homedir(), ".paperclip-run-env");
+
+    // Every process on this host, local ssh client and fixture-side shells alike.
+    const scanAllArgv = async (): Promise<number> => {
+      let hits = 0;
+      for (const entry of await readdir("/proc").catch(() => [] as string[])) {
+        if (!/^\d+$/.test(entry)) continue;
+        const cmdline = await readFile(`/proc/${entry}/cmdline`).catch(() => null);
+        if (cmdline?.includes(sentinel)) hits += 1;
+      }
+      return hits;
+    };
+
+    const target = await buildSshSpawnTarget({
+      spec: { ...config, remoteCwd: started.workspaceDir },
+      command: "sh",
+      args: ["-c", 'printf "%s" "$SYNTH_API_TOKEN" > "$1"; while IFS= read -r line; do printf "got:%s\\n" "$line"; done', "probe", outputPath],
+      env: { SYNTH_API_TOKEN: value },
+    });
+    expect(target.args.join("\0")).not.toContain(sentinel);
+
+    const child = spawn(target.command, target.args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
+    child.stdin.write("first\n");
+    // While the remote command is alive and has the value in its environment,
+    // no argv on the host carries it (the legacy `exec env` form did).
+    const deadline = Date.now() + 10_000;
+    while (!stdout.includes("got:first") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(stdout).toContain("got:first");
+    expect(await scanAllArgv()).toBe(0);
+    child.stdin.end("second\n");
+    expect(await closed).toBe(0);
+    await target.cleanup();
+
+    expect(stdout).toBe("got:first\ngot:second\n");
+    expect(await readFile(outputPath, "utf8")).toBe(value);
+    // The staged file deleted itself; none holding the value remains.
+    for (const name of await readdir(envDir).catch(() => [] as string[])) {
+      const content = await readFile(path.join(envDir, name), "utf8").catch(() => "");
+      expect(content).not.toContain(sentinel);
+    }
+
+    const direct = await runSshCommand(config, 'printf "%s" "$SYNTH_API_TOKEN"', { env: { SYNTH_API_TOKEN: value } });
+    expect(direct.stdout).toBe(value);
+    expect(await scanAllArgv()).toBe(0);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("syncs a local directory into the remote fixture workspace", async () => {
     const rootDir = await createFixtureRootDir();

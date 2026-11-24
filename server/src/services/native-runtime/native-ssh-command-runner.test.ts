@@ -13,7 +13,9 @@ describe("native SSH deliverable output budget", () => {
     // Exercise the real SSH command adapter and its execFile output limit,
     // replacing only the network executable with a deterministic byte source.
     const executable = join(root, "ssh");
-    await writeFile(executable, `#!${process.execPath}\nprocess.stdout.write(require('node:fs').readFileSync(${JSON.stringify(join(root, "response"))}));\n`);
+    // A command env is first staged into a private remote file by a separate
+    // `cat > …` connection that prints nothing; answer only the real command.
+    await writeFile(executable, `#!${process.execPath}\nif (process.argv.at(-1).includes("cat >")) { process.stdin.resume(); process.stdin.on("end", () => process.exit(0)); } else process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(join(root, "response"))}));\n`);
     await chmod(executable, 0o700);
     vi.stubEnv("PATH", `${root}:${process.env.PATH}`);
   });

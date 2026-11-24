@@ -58,21 +58,23 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
-        .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-      for (const [key] of envEntries) {
+      const env = Object.fromEntries(
+        Object.entries(commandInput.env ?? {})
+          .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      );
+      for (const key of Object.keys(env)) {
         if (!isValidShellEnvKey(key)) {
           throw new Error(`Invalid SSH environment variable key: ${key}`);
         }
       }
-      const envPrefix = envEntries.length > 0
-        ? `env ${envEntries.map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} `
-        : "";
-      const commandScript = `exec ${envPrefix}${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`;
+      // The values travel to `runSshCommand`, which sources them from a private
+      // remote file instead of writing `env KEY=value …` into the ssh argv.
+      const commandScript = `exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`;
       const remoteCommand = `cd ${shellQuote(cwd)} && ${commandScript}`;
 
       try {
         const result = await runSshCommand(input.spec, remoteCommand, {
+          env,
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
@@ -156,6 +158,112 @@ export function shellQuote(value: string) {
 
 function isValidShellEnvKey(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+/**
+ * Remote directory for the short-lived per-launch environment files. It is
+ * expanded remotely (so it always lands in the SSH user's own home, on disk)
+ * and is created with mode 0700.
+ */
+const REMOTE_ENV_DIR_EXPR = '"$HOME/.paperclip-run-env"';
+
+/** Orphans (launch never reached the remote shell) are purged after this age. */
+const REMOTE_ENV_ORPHAN_MAX_AGE_MINUTES = 15;
+
+const REMOTE_ENV_PROVISION_TIMEOUT_MS = 30_000;
+const REMOTE_ENV_CLEANUP_TIMEOUT_MS = 15_000;
+
+/**
+ * Shell expression (double-quoted, `$HOME` expanded remotely) for one launch's
+ * environment file. The id is a locally generated UUID, so it needs no quoting.
+ */
+export function remoteEnvFilePathExpr(id: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    throw new Error("Remote environment file id must be a UUID");
+  }
+  return `${REMOTE_ENV_DIR_EXPR.slice(0, -1)}/${id}.env"`;
+}
+
+/**
+ * Body of a per-launch environment file. The first statement deletes the file,
+ * so it is gone from disk as soon as the launch wrapper sources it, before any
+ * value is even assigned and regardless of how the run ends afterwards.
+ */
+export function buildRemoteEnvFileContent(entries: Array<[string, string]>, pathExpr: string): string {
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid SSH environment variable key: ${key}`);
+    }
+  }
+  return [
+    `rm -f -- ${pathExpr}`,
+    ...entries.map(([key, value]) => `export ${key}=${shellQuote(value)}`),
+    "",
+  ].join("\n");
+}
+
+/**
+ * Hand an environment to a remote launch without putting any value on a
+ * command line.
+ *
+ * `exec env KEY=value …` inside the remote script made every value part of the
+ * argv of the local `ssh` client (readable through `/proc/<pid>/cmdline` by any
+ * local user for the whole run, and echoed by Node's "Command failed: ssh …"
+ * errors) and of the remote `sh -c` wrapper. Instead, the values travel over
+ * the stdin of a separate SSH invocation into a 0600 file in a 0700 directory;
+ * that invocation's argv only names the file. The launch wrapper sources the
+ * file, whose first line removes it. `cleanup` removes it if the launch never
+ * got that far, and each provisioning purges orphans older than
+ * REMOTE_ENV_ORPHAN_MAX_AGE_MINUTES (e.g. after a server crash).
+ *
+ * Returns null when there is nothing to inject, so such launches still open a
+ * single connection.
+ */
+export async function provisionRemoteEnvFile(input: {
+  spec: SshConnectionConfig;
+  env: Array<[string, string]>;
+  timeoutMs?: number;
+}): Promise<{ sourceExpr: string; cleanup: () => Promise<void> } | null> {
+  if (input.env.length === 0) return null;
+  const pathExpr = remoteEnvFilePathExpr(randomUUID());
+  const content = buildRemoteEnvFileContent(input.env, pathExpr);
+  // `umask 077` precedes every creation, so neither the directory nor the file
+  // is ever group/world-accessible, not even between creation and chmod.
+  const writeScript = [
+    "umask 077",
+    `mkdir -p ${REMOTE_ENV_DIR_EXPR}`,
+    `test ! -L ${REMOTE_ENV_DIR_EXPR}`,
+    `chmod 700 ${REMOTE_ENV_DIR_EXPR}`,
+    `{ find ${REMOTE_ENV_DIR_EXPR} -maxdepth 1 -type f -name '*.env' -mmin +${REMOTE_ENV_ORPHAN_MAX_AGE_MINUTES} -exec rm -f -- {} + >/dev/null 2>&1 || true; }`,
+    `cat > ${pathExpr}`,
+    `chmod 600 ${pathExpr}`,
+  ].join(" && ");
+  const removeFile = async (timeoutMs: number) => {
+    try {
+      await runSshCommandWithoutEnv(input.spec, `rm -f -- ${pathExpr}`, { timeoutMs });
+    } catch {
+      // An unreachable remote cannot be cleaned now; the orphan purge of the
+      // next launch removes the file.
+    }
+  };
+
+  try {
+    await runSshCommandWithoutEnv(input.spec, writeScript, {
+      stdin: content,
+      timeoutMs: input.timeoutMs && input.timeoutMs > 0
+        ? Math.min(input.timeoutMs, REMOTE_ENV_PROVISION_TIMEOUT_MS)
+        : REMOTE_ENV_PROVISION_TIMEOUT_MS,
+    });
+  } catch (error) {
+    // The write may have landed before ssh reported a timeout or failure.
+    await removeFile(REMOTE_ENV_CLEANUP_TIMEOUT_MS);
+    throw error;
+  }
+
+  return {
+    sourceExpr: pathExpr,
+    cleanup: () => removeFile(REMOTE_ENV_CLEANUP_TIMEOUT_MS),
+  };
 }
 
 export function parseSshRemoteExecutionSpec(value: unknown): SshRemoteExecutionSpec | null {
@@ -1273,49 +1381,58 @@ export function buildKnownHostsEntry(input: {
   return `[${input.host}]:${input.port} ${input.publicKey.trim()}`;
 }
 
-export async function runSshCommand(
+const SSH_LOGIN_PROFILE_STEPS = [
+  'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+];
+
+function collectSshEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  const entries = Object.entries(env ?? {})
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid SSH environment variable key: ${key}`);
+    }
+  }
+  return entries;
+}
+
+/**
+ * One SSH connection running `remoteCommand` after the login profiles. When
+ * `envSourceExpr` is set, the provisioned environment file is sourced after the
+ * profiles (so caller overrides still win over anything a profile re-exports)
+ * and before the command. No environment value ever appears in the argv.
+ */
+async function runSshCommandWithoutEnv(
   config: SshConnectionConfig,
   remoteCommand: string,
   options: {
-    env?: Record<string, string>;
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
   } = {},
+  envSourceExpr: string | null = null,
 ): Promise<SshCommandResult> {
   let cleanup: () => Promise<void> = () => Promise.resolve();
   try {
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
-    const envEntries = Object.entries(options.env ?? {})
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-    for (const [key] of envEntries) {
-      if (!isValidShellEnvKey(key)) {
-        throw new Error(`Invalid SSH environment variable key: ${key}`);
-      }
-    }
 
-    // Mirror buildSshSpawnTarget: source the login profiles first, then run
-    // `env KEY=VAL cmd` so user-supplied identity overrides win over anything a
-    // profile re-exports. The SSH target is an operator-configured host, not a
+    // Source the login profiles first, then the caller's environment, then run
+    // the command. The SSH target is an operator-configured host, not a
     // Paperclip sandbox image, so it can expose `node` or an agent CLI only
     // through a login profile; a non-login SSH command would miss that PATH.
     // Source `/etc/profile` first so a host that exposes the PATH through
     // `/etc/profile.d` scripts still resolves node and the agent CLI.
-    // The script no longer sources `nvm.sh`; a profile that adds nvm still runs.
     // .bash_profile typically sources .bashrc itself; only source .bashrc
-    // directly when no .bash_profile exists, so a host that adds nvm in
-    // .bashrc still resolves node without a double-run of the setup.
-    const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
+    // directly when no .bash_profile exists.
     const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-      envArgs.length > 0
-        ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-        : `exec sh -c ${shellQuote(remoteCommand)}`,
+      ...SSH_LOGIN_PROFILE_STEPS,
+      ...(envSourceExpr ? [`. ${envSourceExpr}`] : []),
+      `exec sh -c ${shellQuote(remoteCommand)}`,
     ].join(" && ");
 
     sshArgs.push(
@@ -1340,6 +1457,57 @@ export async function runSshCommand(
   }
 }
 
+export async function runSshCommand(
+  config: SshConnectionConfig,
+  remoteCommand: string,
+  options: {
+    env?: Record<string, string>;
+    stdin?: string;
+    timeoutMs?: number;
+    maxBuffer?: number;
+  } = {},
+): Promise<SshCommandResult> {
+  const { env, ...commandOptions } = options;
+  const envEntries = collectSshEnvEntries(env);
+  if (envEntries.length === 0) {
+    return await runSshCommandWithoutEnv(config, remoteCommand, commandOptions);
+  }
+
+  // The environment goes through a private remote file, never through the
+  // ssh argv (see provisionRemoteEnvFile). The caller's timeout covers both
+  // connections; 0 keeps Node's "no timeout" meaning.
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const startedAt = Date.now();
+  const envFile = await provisionRemoteEnvFile({ spec: config, env: envEntries, timeoutMs });
+  let consumed = false;
+  try {
+    let remainingMs = timeoutMs;
+    if (timeoutMs > 0) {
+      remainingMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) {
+        throw Object.assign(new Error(`SSH command timed out after ${timeoutMs}ms`), {
+          stdout: "",
+          stderr: "",
+          code: null,
+          killed: true,
+        });
+      }
+    }
+    const result = await runSshCommandWithoutEnv(
+      config,
+      remoteCommand,
+      { ...commandOptions, timeoutMs: remainingMs },
+      envFile?.sourceExpr ?? null,
+    );
+    // A successful command ran after the `&&`-chained source step, whose first
+    // line deleted the file: no extra round-trip is needed.
+    consumed = true;
+    return result;
+  } finally {
+    if (!consumed) await envFile?.cleanup();
+  }
+}
+
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
   command: string;
@@ -1350,37 +1518,33 @@ export async function buildSshSpawnTarget(input: {
   args: string[];
   cleanup: () => Promise<void>;
 }> {
-  for (const key of Object.keys(input.env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid SSH environment variable key: ${key}`);
-    }
+  const envEntries = collectSshEnvEntries(input.env);
+  // Provision before creating the local auth material, so a provisioning
+  // failure leaves no temporary key file behind.
+  const envFile = await provisionRemoteEnvFile({ spec: input.spec, env: envEntries });
+  let auth: { args: string[]; cleanup: () => Promise<void> };
+  try {
+    auth = await createSshAuthArgs(input.spec);
+  } catch (error) {
+    await envFile?.cleanup();
+    throw error;
   }
-  const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  // Source the login profiles first, then run `env KEY=VAL cmd` so
-  // user-supplied identity overrides win over anything a profile re-exports.
-  // The SSH target is an operator-configured host, not a Paperclip sandbox
-  // image, so it can expose `node` or an agent CLI only through a login
-  // profile; a non-login SSH command would miss that PATH. Source
-  // `/etc/profile` first so a host that exposes the PATH through
-  // `/etc/profile.d` scripts still resolves node and the agent CLI. The script
-  // no longer sources `nvm.sh`; a profile that adds nvm still runs.
-  // .bash_profile typically sources .bashrc itself; only source .bashrc
-  // directly when no .bash_profile exists, so a host that adds nvm in
-  // .bashrc still resolves node without a double-run of the setup.
+  // Source the login profiles first, then the caller's environment, so
+  // user-supplied identity overrides win over anything a profile re-exports
+  // (see runSshCommandWithoutEnv for why the profiles are needed).
+  //
+  // Never `exec env KEY=value …` here: this ssh client lives for the whole
+  // agent run, so every value would sit in its world-readable
+  // /proc/<pid>/cmdline for that entire time. The values are sourced from a
+  // 0600 file that deletes itself as it is read. It is sourced before `cd` so
+  // a missing remote directory still consumes (deletes) the file.
   const remoteScript = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    ...SSH_LOGIN_PROFILE_STEPS,
+    ...(envFile ? [`. ${envFile.sourceExpr}`] : []),
     `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
+    `exec ${remoteCommandParts}`,
   ].join(" && ");
 
   sshArgs.push(
@@ -1393,7 +1557,13 @@ export async function buildSshSpawnTarget(input: {
   return {
     command: "ssh",
     args: sshArgs,
-    cleanup: auth.cleanup,
+    cleanup: async () => {
+      // The file normally deleted itself when the run sourced it; this only
+      // matters if the launch never reached the remote shell. It runs in the
+      // background so an unreachable host cannot delay the run result.
+      if (envFile) void envFile.cleanup();
+      await auth.cleanup();
+    },
   };
 }
 
