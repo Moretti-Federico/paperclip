@@ -36,8 +36,14 @@ test "$(docker run --rm --network none --entrypoint sha256sum "$TAG" "$CHUNK" | 
 docker run --rm --network none --entrypoint node "$TAG" --check "$CHUNK"
 # Only the chunk differs from the base runtime.
 list() { docker run --rm --network none --entrypoint sh "$1" -c 'cd /app/server/dist-runtime && find . -type f -exec sha256sum {} + | sort -k2'; }
-diff <(list "$BASE") <(list "$TAG") | grep '^[<>]' | awk '{print $1, $3}'
-test "$(diff <(list "$BASE") <(list "$TAG") | grep -c '^>')" = "1"
+list "$BASE" > "$STAGE/runtime-base.sha256"
+list "$TAG" > "$STAGE/runtime-candidate.sha256"
+# diff exits 1 when the lists differ, which is the expected case here.
+diff "$STAGE/runtime-base.sha256" "$STAGE/runtime-candidate.sha256" > "$STAGE/runtime.diff" || true
+cat "$STAGE/runtime.diff"
+test "$(grep -c '^>' "$STAGE/runtime.diff")" = "1"
+test "$(grep -c '^<' "$STAGE/runtime.diff")" = "1"
+grep -q "^> $NEW_CHUNK_SHA  ./chunk-3ZK6CBQV.mjs$" "$STAGE/runtime.diff"
 docker run --rm --network none --entrypoint sh "$TAG" -c "! grep -q 'exec env \${envArgs' $CHUNK && grep -q 'paperclip-run-env' $CHUNK"
 docker run --rm --network none --entrypoint node "$TAG" --input-type=module -e "
   const m = await import('file://$CHUNK');
